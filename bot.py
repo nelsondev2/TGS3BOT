@@ -45,6 +45,8 @@ from boto3.s3.transfer import TransferConfig
 
 # Telethon: cliente de Telegram
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
@@ -847,9 +849,35 @@ def _setup_signal_handlers():
     signal.signal(signal.SIGINT, handler)
 
 
+# ============== FLOODWAIT HANDLING ==============
+_session_string_saved = False
+
+
+def _handle_floodwait(e: FloodWaitError):
+    """Maneja FloodWaitError sin crashear — duerme y deja que Render reinicie solo."""
+    wait = e.seconds
+    log.error(
+        f"🚫 FloodWait de Telegram: hay que esperar {wait}s ({wait/60:.1f} min). "
+        f"Esto NO es un bug — Telegram rate-limita logins repetidos. "
+        f"El proceso dormirá y saldrá para que Render lo reinicie después."
+    )
+    # Duerme un poco más del wait + margen, pero en pasos pequeños para poder
+    # responder a SIGTERM si llega.
+    sleep_total = wait + 60  # 1 min de margen
+    log.info(f"Durmiendo {sleep_total}s antes de salir graceful...")
+    end_at = time.time() + sleep_total
+    while time.time() < end_at:
+        if _shutdown_event.is_set():
+            log.info("Shutdown solicitado, saliendo antes de FloodWait completo")
+            return
+        time.sleep(5)
+    log.warning("FloodWait cumplido, saliendo para que Render reinicie el proceso")
+    os._exit(0)
+
+
 # ============== MAIN ==============
 async def main():
-    global _loop, _tg_client
+    global _loop, _tg_client, _session_string_saved
     _loop = asyncio.get_running_loop()
 
     # Validar config de Telegram
@@ -863,25 +891,63 @@ async def main():
     asyncio.create_task(watchdog())
 
     # --- Inicializar Telethon ---
-    if TG_BOT_TOKEN:
-        # Modo bot oficial
-        log.info("🤖 Iniciando Telethon en modo BOT (con BOT_TOKEN)")
+    # Sesión persistente: si hay TG_SESSION_STRING, úsala (incluso en modo bot).
+    # Si no, usa archivo en disco persistente (DOWNLOAD_PATH) para no re-login en cada deploy.
+    session_path = os.path.join(DOWNLOAD_PATH, "tg_s3_bot.session")
+    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+
+    # Detectar si la sesión en disco ya existe (evita el bloque de "primer login")
+    global _session_string_saved
+    if os.path.exists(session_path):
+        _session_string_saved = True
+        log.info(f"📦 Sesión existente encontrada en {session_path}")
+
+    if TG_SESSION_STRING:
+        # StringSession tiene prioridad — no requiere re-login nunca
+        log.info("🔗 Usando TG_SESSION_STRING pre-generada (sin re-login)")
         _tg_client = TelegramClient(
-            "tg_s3_bot",
+            StringSession(TG_SESSION_STRING),
             api_id=TG_API_ID,
             api_hash=TG_API_HASH,
         )
-        await _tg_client.start(bot_token=TG_BOT_TOKEN)
-    elif TG_SESSION_STRING:
-        # Modo userbot (sesión pre-generada)
-        log.info("👤 Iniciando Telethon en modo USERBOT (con SESSION_STRING)")
+        try:
+            await _tg_client.start()
+        except FloodWaitError as e:
+            _handle_floodwait(e)
+            return
+
+    elif TG_BOT_TOKEN:
+        # Modo bot oficial con sesión en disco persistente
+        log.info(f"🤖 Iniciando Telethon en modo BOT (sesión: {session_path})")
         _tg_client = TelegramClient(
-            "tg_s3_bot",
+            session_path,
             api_id=TG_API_ID,
             api_hash=TG_API_HASH,
-            session=TG_SESSION_STRING,
         )
-        await _tg_client.start()
+        try:
+            await _tg_client.start(bot_token=TG_BOT_TOKEN)
+        except FloodWaitError as e:
+            _handle_floodwait(e)
+            return
+
+        # Si la sesión recién se creó, mostrar el StringSession para que el usuario
+        # lo guarde como env var y evitar futuros re-logins.
+        if not _session_string_saved:
+            try:
+                session_str = _tg_client.session.save()
+                # Guardar en disco para futuras referencias
+                hint_path = os.path.join(DOWNLOAD_PATH, "SESSION_STRING.txt")
+                with open(hint_path, "w") as f:
+                    f.write(session_str)
+                log.warning(
+                    "⚠️  PRIMER LOGIN — guarda este SESSION_STRING como env var "
+                    f"TG_SESSION_STRING para evitar re-logins y FloodWait:\n"
+                    f"{session_str}\n"
+                    f"(También guardado en {hint_path})"
+                )
+            except Exception as e:
+                log.warning(f"No se pudo exportar SESSION_STRING: {e}")
+
     else:
         log.error(
             "❌ Falta TG_BOT_TOKEN o TG_SESSION_STRING. "

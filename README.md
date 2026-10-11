@@ -96,6 +96,18 @@ asyncio.run(main())
 
 2. Guarda el string resultante como `TG_SESSION_STRING`.
 
+### Paso 2.5: Generar SESSION_STRING para un BOT (alternativa al disco persistente)
+
+Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free) y quieres evitar re-logins, puedes extraer el `SESSION_STRING` después del primer arranque exitoso del bot:
+
+1. Arranca el bot por primera vez con `TG_BOT_TOKEN`.
+2. En los logs verás un mensaje `⚠️ PRIMER LOGIN — guarda este SESSION_STRING...` con un string largo.
+3. Copia ese string y configúralo como variable de entorno `TG_SESSION_STRING`.
+4. Borra `TG_BOT_TOKEN` (o déjalo, `TG_SESSION_STRING` tiene prioridad) y redéploy.
+5. A partir de ahí, el bot usa la sesión string y nunca más necesita re-login.
+
+**Importante:** Esto evita el `FloodWaitError` que ocurre cuando Telegram rate-limita múltiples logins seguidos.
+
 ### Paso 3: Obtener tu ID de Telegram (para ALLOWED_TG_IDS)
 
 1. Habla con **@userinfobot** o **@RawDataBot** en Telegram.
@@ -184,6 +196,34 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 9. Sin detección de Content-Type
 10. SIGTERM sin handler registrado
 11. Sin timeout en upload S3
+12. Sesión Telethon no persistente → `FloodWaitError` tras múltiples deploys
+
+## 🆘 Troubleshooting
+
+### `FloodWaitError: A wait of N seconds is required`
+
+**Causa:** Telegram rate-limita logins. Si re-desplegas varias veces seguidas en poco tiempo, Telegram te bloquea por N segundos (~36 min en algunos casos).
+
+**Solución inmediata:**
+1. Espera los N segundos indicados por Telegram (no reintentes antes, eso empeora).
+2. El bot ahora maneja `FloodWaitError` automáticamente: duerme el tiempo indicado y sale limpio. Render lo reiniciará pasado ese tiempo.
+
+**Solución permanente:**
+1. Tras el primer arranque exitoso, copia el `SESSION_STRING` de los logs (mensaje `⚠️ PRIMER LOGIN —`).
+2. Configúralo como variable de entorno `TG_SESSION_STRING`.
+3. A partir de ahí, el bot nunca más hace login contra Telegram → no más FloodWait.
+
+### Sesión se pierde en cada deploy (Render free)
+
+Si no quieres usar `TG_SESSION_STRING`, asegúrate de que:
+1. El disco persistente definido en `render.yaml` está correctamente montado en `/tmp/tg_uploads` (o el valor de `DOWNLOAD_PATH`).
+2. El plan de Render soporta discos persistentes (el plan free los soporta con tamaño máximo 1 GB).
+
+El bot guarda la sesión en `DOWNLOAD_PATH/tg_s3_bot.session`. Si ese path es persistente, no necesitas re-login en cada deploy.
+
+### `AttributeError: 'TelegramClient' object has no attribute 'add_handler'`
+
+Esto ya está corregido. El método correcto es `add_event_handler(callback, event)`. Si lo ves, actualiza a la última versión del código.
 
 ## 📄 Licencia
 
