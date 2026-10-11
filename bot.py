@@ -893,9 +893,12 @@ async def main():
     me_name = getattr(me, "username", None) or getattr(me, "first_name", None) or str(me.id)
     log.info(f"✅ Telegram conectado como: {me_name} (id={me.id})")
 
-    # Registrar handler
+    # Registrar handler (callback, event)
+    # En Telethon: client.add_handler(callback, event_type)
+    # events.NewMessage(incoming=True) filtra mensajes salientes automáticamente.
     _tg_client.add_handler(
-        events.NewMessage(incoming=True, func=lambda e: not e.out)(on_tg_message)
+        on_tg_message,
+        events.NewMessage(incoming=True)
     )
 
     if ALLOWED_TG_IDS is not None:
