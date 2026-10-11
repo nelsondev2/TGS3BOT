@@ -1,0 +1,66 @@
+# Render deployment config - Telegram S3 Bot
+# https://render.com/docs/blueprint-spec
+# Crea este servicio en Render como "Web Service" usando "Python" o "Docker".
+
+services:
+  - type: web
+    name: telegram-s3-bot
+    runtime: python
+    # Alternativa: runtime: docker (usando el Dockerfile incluido)
+    region: oregon  # ajusta según tu región preferida
+    plan: free  # free, starter, standard, pro
+    branch: main
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    healthCheckTimeout: 60
+    autoDeploy: true
+    # Render inyecta automáticamente la variable PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # === Telegram (obligatorio) ===
+      - key: TG_API_ID
+        sync: false  # setea en panel: https://my.telegram.org/apps
+      - key: TG_API_HASH
+        sync: false
+      # Modo bot:
+      - key: TG_BOT_TOKEN
+        sync: false  # créalo con @BotFather
+      # O modo userbot (uno de los dos):
+      - key: TG_SESSION_STRING
+        sync: false
+      # === Seguridad ===
+      - key: ALLOWED_TG_IDS
+        # CSV de IDs autorizados, ej: "123456789,987654321"
+        sync: false
+      - key: SSRF_BLOCK_PRIVATE
+        value: "1"
+      # === S3 (toDus por defecto) ===
+      - key: S3_ENDPOINT
+        value: "https://s3.todus.cu"
+      - key: S3_BUCKET
+        value: "stream"
+      - key: S3_UNSIGNED
+        value: "1"
+      # === Comportamiento ===
+      - key: MAX_FILE_SIZE_MB
+        value: "2000"
+      - key: PARALLEL_URL_DOWNLOAD
+        value: "1"
+      - key: WATCHDOG_ENABLED
+        value: "1"
+      - key: WATCHDOG_LIFETIME
+        value: "14100"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: ALWAYS_SHOW_S3_URL
+        value: "1"
+      - key: SEND_FILE_VIA_TG
+        value: "1"
+    disk:
+      # Disco efímero para descargas temporales
+      name: tmp-downloads
+      mountPath: /tmp/tg_uploads
+      sizeGB: 1
