@@ -894,9 +894,9 @@ async def main():
     log.info(f"✅ Telegram conectado como: {me_name} (id={me.id})")
 
     # Registrar handler (callback, event)
-    # En Telethon: client.add_handler(callback, event_type)
+    # En Telethon: client.add_event_handler(callback, event_type)
     # events.NewMessage(incoming=True) filtra mensajes salientes automáticamente.
-    _tg_client.add_handler(
+    _tg_client.add_event_handler(
         on_tg_message,
         events.NewMessage(incoming=True)
     )
