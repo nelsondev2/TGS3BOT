@@ -58,7 +58,9 @@ services:
       - key: ALWAYS_SHOW_S3_URL
         value: "1"
       - key: SEND_FILE_VIA_TG
-        value: "1"
+        # Por defecto "0" = solo URL S3 (ahorra datos en toDus)
+        # "1" = reenviar archivo + URL S3
+        value: "0"
     disk:
       # Disco efímero para descargas temporales
       name: tmp-downloads

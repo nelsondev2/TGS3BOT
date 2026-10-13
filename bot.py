@@ -104,7 +104,11 @@ SSRF_BLOCK_PRIVATE = os.environ.get("SSRF_BLOCK_PRIVATE", "1") == "1"
 
 # --- Comportamiento ---
 ALWAYS_SHOW_S3_URL = os.environ.get("ALWAYS_SHOW_S3_URL", "1") == "1"
-SEND_FILE_VIA_TG = os.environ.get("SEND_FILE_VIA_TG", "1") == "1"
+# Por defecto NO se reenvía el archivo (solo URL S3 como texto).
+# Esto ahorra datos en toDus (los mensajes de texto son ilimitados).
+# Cambiar a "1" para que por defecto SÍ se reenvíe el archivo.
+# Los usuarios pueden activar/desactivar con /sendfile.
+SEND_FILE_VIA_TG = os.environ.get("SEND_FILE_VIA_TG", "0") == "1"
 
 # --- HTTP Headers ---
 BROWSER_HEADERS = {
@@ -151,6 +155,8 @@ _s3_session = aioboto3.Session()
 _loop = None
 _shutdown_event = asyncio.Event()
 _tg_client = None
+_tg_owner_id = None  # ID del dueño (en modo userbot) para filtrar mensajes
+_is_userbot_mode = False  # True si usa TG_SESSION_STRING (sin BOT_TOKEN)
 
 
 # ============== HELPERS ==============
@@ -197,11 +203,11 @@ class QueuedJob:
     __slots__ = (
         "job_id", "user_id", "kind", "url", "original_name",
         "task", "created_at", "cancel_requested", "temp_paths",
-        "status_msg", "chat_id",
+        "status_msg", "chat_id", "message",
     )
 
     def __init__(self, user_id, kind, url=None, original_name=None,
-                 chat_id=None, status_msg=None):
+                 chat_id=None, status_msg=None, message=None):
         self.job_id = uuid.uuid4().hex
         self.user_id = user_id
         self.kind = kind
@@ -213,6 +219,7 @@ class QueuedJob:
         self.temp_paths = []
         self.status_msg = status_msg  # mensaje de estado a editar
         self.chat_id = chat_id
+        self.message = message  # mensaje original de Telegram (para media)
 
 
 class SimpleLock:
@@ -339,6 +346,146 @@ def cleanup_paths(paths):
 
 
 # ============== TELEGRAM SEND/EDIT HELPERS ==============
+# ============== UI: tarjetas profesionales ==============
+# Diseño minimalista: solo info útil al usuario, sin caracteres de borde ruidosos.
+
+# Iconos limpios (Telegram los renderiza bien como emoji)
+ICON_PROCESSING = "⏳"
+ICON_DONE = "✓"
+ICON_ERROR = "✗"
+ICON_CANCEL = "⊘"
+ICON_LINK = "🔗"
+ICON_FILE = "📄"
+ICON_DOWNLOAD = "↓"
+ICON_CLOUD = "☁"
+
+
+def _render_result_card(name, ext, size, s3_url, kind="archivo",
+                         source=None, send_file=False, sent_as=None):
+    """Genera la tarjeta final del resultado.
+
+    Formato limpio y profesional:
+        ✓ Subido a S3
+        Nombre archivo.mp4
+        MP4 · 15.2 MB · nube
+        https://s3.todus.cu/stream/a1b2c3d4_archivo.mp4
+    """
+    lines = [f"{ICON_DONE} Subido a S3"]
+
+    if source:
+        lines.append(f"📎 Origen: {source}")
+    lines.append(f"{ICON_FILE} {name}.{ext}" if ext and not name.endswith(f".{ext}") else f"{ICON_FILE} {name}")
+
+    meta_parts = []
+    if ext:
+        meta_parts.append(ext.upper())
+    if size:
+        meta_parts.append(format_size(size))
+    meta_parts.append("nube")
+    if meta_parts:
+        lines.append(" · ".join(meta_parts))
+
+    if sent_as:
+        labels = {"imagen": "foto", "video": "video", "audio": "audio",
+                  "nota de voz": "nota de voz", "archivo": "documento"}
+        lines.append(f"Enviado como {labels.get(sent_as, sent_as)}")
+
+    lines.append("")  # separador
+    lines.append(f"{ICON_LINK} {s3_url}")
+    return "\n".join(lines)
+
+
+def _render_status_progress(step, filename=None, size=None):
+    """Estado de progreso minimalista.
+
+    step: 'downloading' | 'uploading' | 'receiving'
+    """
+    icons = {"downloading": f"{ICON_PROCESSING} Descargando",
+             "uploading": f"{ICON_PROCESSING} Subiendo",
+             "receiving": f"{ICON_PROCESSING} Recibiendo"}
+    base = icons.get(step, f"{ICON_PROCESSING} Procesando")
+    parts = [base]
+    if filename:
+        parts.append(filename)
+    if size:
+        parts.append(f"· {format_size(size)}")
+    return " ".join(parts)
+
+
+def _render_error(msg):
+    """Mensaje de error limpio."""
+    return f"{ICON_ERROR} {msg}"
+
+
+def _render_cancel():
+    return f"{ICON_CANCEL} Cancelado"
+
+
+def _render_help(is_userbot=False):
+    """Tarjeta de ayuda profesional."""
+    lines = [
+        f"🤖 **Bot S3** — sube archivos a la nube y te devuelve el enlace",
+        "",
+        "¿Qué puedo hacer?",
+        f"  • Envía un enlace `http(s)://...` y lo subo",
+        f"  • Reenvía un archivo (foto, video, audio, doc) y lo subo",
+        "",
+        "Por defecto solo te envío la **URL** como texto (ahorra datos en toDus).",
+        "Si quieres recibir el archivo además de la URL, usa /sendfile.",
+        "",
+        "Comandos",
+        "  /cancel — cancela tu trabajo actual",
+        "  /status — muestra si tienes trabajo en curso",
+        "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
+    ]
+    if is_userbot:
+        lines.extend([
+            "",
+            "👤 **Modo userbot**: solo respondo a mensajes del dueño.",
+            "Pega enlaces o reenvía archivos en *Saved Messages* para usar el bot.",
+        ])
+    return "\n".join(lines)
+
+
+def _render_sendfile_state(enabled):
+    if enabled:
+        return f"{ICON_DONE} Modo archivo activado\n\nA partir de ahora recibirás el archivo además de la URL."
+    else:
+        return f"{ICON_DONE} Modo archivo desactivado\n\nSolo recibirás la URL S3 (ahorra datos en toDus)."
+
+
+def _render_unauthorized():
+    return f"{ICON_ERROR} No estás autorizado para usar este bot."
+
+
+def _render_busy():
+    return f"{ICON_PROCESSING} Ya tienes un trabajo en curso. Usa /cancel para detenerlo."
+
+
+def _render_no_active_job():
+    return "No tienes trabajos activos."
+
+
+def _render_active_job():
+    return f"{ICON_PROCESSING} Tienes un trabajo en curso."
+
+
+def _render_no_url():
+    return f"Envía un enlace (http/https) o reenvía un archivo para procesar."
+
+
+def _tipo_label(tipo):
+    """Convierte el tipo interno a una etiqueta amigable."""
+    labels = {
+        "imagen": "foto",
+        "video": "video",
+        "audio": "audio",
+        "nota de voz": "nota de voz",
+        "archivo": "documento",
+    }
+    return labels.get(tipo, tipo)
+
+
 async def tg_send_status(chat_id, text):
     """Envía un mensaje de estado inicial y lo retorna para editar después."""
     global _tg_client
@@ -530,7 +677,182 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
 
 # ============== MAIN PROCESSOR ==============
 async def process_job(job):
-    await _process_url(job)
+    if job.kind == "tg_media":
+        await _process_tg_media(job)
+    else:
+        await _process_url(job)
+
+
+async def _process_tg_media(job):
+    """Descarga un archivo reenviado desde Telegram y lo sube a S3.
+
+    Soporta:
+    - Fotos, videos, audios, documentos
+    - Mensajes reenviados (fwd_from) — identifica el chat de origen
+    - Captions del mensaje original (no se procesan, solo se ignoran)
+    - Mensajes de grupos/canales
+    """
+    global _tg_client
+    chat_id = job.chat_id
+    status_msg = job.status_msg
+    message = job.message
+
+    if not message or not message.media:
+        await tg_edit_status(chat_id, status_msg, _render_error("No hay media para procesar."))
+        return
+
+    try:
+        # Detectar origen si es reenviado de otro chat
+        source_label = None
+        fwd_from = getattr(message, "fwd_from", None)
+        if fwd_from:
+            # fwd_from puede tener from_id (usuario) o from_name (canal oculto)
+            from_id = getattr(fwd_from, "from_id", None)
+            from_name = getattr(fwd_from, "from_name", None)
+            if from_name:
+                source_label = f"canal {from_name}"
+            elif from_id:
+                # from_id es PeerUser/PeerChannel/PeerChat
+                peer_type = type(from_id).__name__.replace("Peer", "").lower()
+                peer_id = getattr(from_id, "user_id", None) or getattr(from_id, "channel_id", None) or getattr(from_id, "chat_id", None)
+                if peer_id:
+                    source_label = f"{peer_type} {peer_id}"
+
+        # Determinar nombre y extensión del archivo
+        filename = None
+        size_hint = 0
+
+        doc = getattr(message.media, "document", None)
+        if doc:
+            for attr in (doc.attributes or []):
+                fname = getattr(attr, "file_name", None)
+                if fname:
+                    filename = fname
+                    break
+            if not filename:
+                mime = doc.mime_type or "application/octet-stream"
+                ext = ext_from_content_type(mime) or ".bin"
+                filename = f"tg_{uuid.uuid4().hex[:8]}{ext}"
+            size_hint = doc.size or 0
+        else:
+            # Photo
+            filename = f"tg_{uuid.uuid4().hex[:8]}.jpg"
+            size_hint = 0
+
+        # Verificar tamaño si está disponible
+        if size_hint and size_hint > MAX_FILE_SIZE:
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_error(f"Archivo de {format_size(size_hint)} — supera el límite de {format_size(MAX_FILE_SIZE)}.")
+            )
+            return
+
+        safe_name = sanitize_filename(filename)
+        ext = os.path.splitext(safe_name)[1] or ".bin"
+        temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+        job.temp_paths.append(temp_path)
+
+        check_disk_space()
+        # Mensaje de progreso único, minimalista
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_status_progress("receiving", safe_name, size_hint)
+        )
+
+        # Descargar con Telethon
+        try:
+            async with asyncio.timeout(1800):
+                await _tg_client.download_media(
+                    message=message,
+                    file=temp_path,
+                )
+        except asyncio.TimeoutError:
+            raise RuntimeError("Tiempo agotado descargando desde Telegram")
+        except Exception as e:
+            raise RuntimeError(f"Error descargando desde Telegram: {e}")
+
+        if not os.path.exists(temp_path):
+            raise RuntimeError("La descarga no produjo ningún archivo")
+
+        size = os.path.getsize(temp_path)
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(f"Archivo descargado ({format_size(size)}) supera el límite")
+
+        filename = safe_name
+
+        # Mensaje de progreso: subiendo
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_status_progress("uploading", filename, size)
+        )
+
+        url_final = await subir_a_s3(temp_path, filename, size)
+
+        name = re.sub(
+            r"^[0-9a-f]{8}_", "",
+            os.path.splitext(filename)[0]
+        ).replace("_", " ")
+        ext_out = os.path.splitext(filename)[1].replace(".", "")
+
+        send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
+
+        if not send_file:
+            # Solo URL como texto (default)
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    source=source_label
+                )
+            )
+            log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            return
+
+        # Enviar archivo + caption
+        caption = _render_result_card(
+            name=name, ext=ext_out, size=size, s3_url=url_final,
+            source=source_label
+        )
+        tipo, send_err = await _send_file_via_telegram(
+            chat_id, temp_path, filename, size, caption
+        )
+
+        if tipo:
+            log.info(f"OK enviado {tipo} a {chat_id}: {filename}")
+            # El archivo ya fue enviado con el caption. El status_msg final lo reemplazamos por algo limpio.
+            await tg_edit_status(
+                chat_id, status_msg,
+                f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}"
+            )
+        else:
+            # Falló el envío → al menos la URL quedó en el caption intentado. Mostramos URL y error.
+            err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    source=source_label
+                ) + f"\n\n{_render_error(err_msg)}"
+            )
+
+    except asyncio.CancelledError:
+        try:
+            await tg_edit_status(chat_id, status_msg, _render_cancel())
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.exception("error procesando media de Telegram")
+        try:
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_error(str(e)[:200])
+            )
+        except Exception:
+            pass
+    finally:
+        cleanup_paths(job.temp_paths)
+        job.temp_paths.clear()
 
 
 async def _process_url(job):
@@ -542,7 +864,7 @@ async def _process_url(job):
     safe, err = _is_safe_url(url)
     if not safe:
         log.warning(f"SSRF bloqueado: {url} - {err}")
-        await tg_edit_status(chat_id, status_msg, f"❌ URL no permitida: {err}")
+        await tg_edit_status(chat_id, status_msg, _render_error(f"URL no permitida: {err}"))
         return
 
     raw_name = get_filename_from_url(url)
@@ -556,8 +878,10 @@ async def _process_url(job):
 
     try:
         check_disk_space()
-        status_msg = await tg_send_status(
-            chat_id, f"📥 Descargando `{filename}`..."
+        # Estado inicial: descargando
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_status_progress("downloading", filename)
         )
 
         async with aiohttp.ClientSession() as session:
@@ -576,7 +900,7 @@ async def _process_url(job):
 
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(
-                        f"Archivo {format_size(total)} supera el límite"
+                        f"Archivo de {format_size(total)} — supera el límite"
                     )
 
                 size_downloaded = 0
@@ -609,7 +933,6 @@ async def _process_url(job):
             inferred_ext = ext_from_content_type(content_type)
             if inferred_ext:
                 filename = filename.rsplit(".", 1)[0] + inferred_ext
-                # Renombrar archivo temporal
                 new_temp = temp_path.rsplit(".", 1)[0] + inferred_ext
                 try:
                     os.rename(temp_path, new_temp)
@@ -623,9 +946,10 @@ async def _process_url(job):
 
         size = os.path.getsize(temp_path)
 
-        status_msg = await tg_edit_status(
+        # Estado: subiendo
+        await tg_edit_status(
             chat_id, status_msg,
-            f"☁️ Subiendo a S3...\n📊 `{format_size(size)}`"
+            _render_status_progress("uploading", filename, size)
         )
 
         url_final = await subir_a_s3(temp_path, filename, size)
@@ -636,44 +960,48 @@ async def _process_url(job):
         ).replace("_", " ")
         ext_out = os.path.splitext(filename)[1].replace(".", "")
 
-        # Caption SIEMPRE con la URL S3 visible
-        caption = (
-            f"┎ **NAME:** {name}\n"
-            f"┠ **EXTENSION:** {ext_out}\n"
-            f"┠ **SIZE:** {format_size(size)}\n"
-            f"┠ **CLOUD:** S3\n"
-            f"┖ **URL:** {url_final}"
-        )
+        send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
 
+        if not send_file:
+            # Default: solo URL como texto
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    source="web"
+                )
+            )
+            log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            return
+
+        # Enviar archivo + caption
+        caption = _render_result_card(
+            name=name, ext=ext_out, size=size, s3_url=url_final,
+            source="web"
+        )
         tipo, send_err = await _send_file_via_telegram(
             chat_id, temp_path, filename, size, caption
         )
 
-        # ===== FIX PRINCIPAL: SIEMPRE mostrar URL S3 =====
         if tipo:
-            log.info(f"✅ Enviado {tipo} a {chat_id}: {filename}")
-            # El caption ya se envió con el archivo. Editar el status_msg final.
+            log.info(f"OK enviado {tipo} a {chat_id}: {filename}")
             await tg_edit_status(
                 chat_id, status_msg,
-                f"✅ Enviado como **{tipo}**\n"
-                f"📊 `{format_size(size)}` • `{ext_out}`\n"
-                f"☁️ S3 URL: {url_final}"
+                f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}"
             )
         else:
-            # No se pudo enviar como media → enviar solo el caption con la URL
+            err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
             await tg_edit_status(
                 chat_id, status_msg,
-                f"⚠️ No se pudo enviar como media: `{send_err or 'desconocido'}`\n\n"
-                f"┎ **NAME:** {name}\n"
-                f"┠ **EXTENSION:** {ext_out}\n"
-                f"┠ **SIZE:** {format_size(size)}\n"
-                f"┠ **CLOUD:** S3\n"
-                f"┖ **URL:** {url_final}"
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    source="web"
+                ) + f"\n\n{_render_error(err_msg)}"
             )
 
     except asyncio.CancelledError:
         try:
-            await tg_edit_status(chat_id, status_msg, "❌ Cancelado")
+            await tg_edit_status(chat_id, status_msg, _render_cancel())
         except Exception:
             pass
         raise
@@ -682,7 +1010,7 @@ async def _process_url(job):
         try:
             await tg_edit_status(
                 chat_id, status_msg,
-                f"❌ Error: `{str(e)[:200]}`"
+                _render_error(str(e)[:200])
             )
         except Exception:
             pass
@@ -692,8 +1020,18 @@ async def _process_url(job):
 
 
 # ============== TELEGRAM EVENT HANDLERS ==============
+# Usuarios que han activado /sendfile (recibir el archivo además de la URL)
+# Por defecto el bot SOLO envía la URL (ahorra datos en toDus).
+_sendfile_users = set()
+
+
 async def on_tg_message(event):
-    """Handler de mensajes entrantes de Telegram (Telethon)."""
+    """Handler de mensajes entrantes de Telegram (Telethon).
+
+    Acepta:
+    - URLs (http/https) en texto → descarga y sube a S3
+    - Archivos reenviados (fotos, videos, audios, documentos) → sube a S3
+    """
     try:
         chat_id = event.chat_id
         sender = await event.get_sender()
@@ -704,61 +1042,104 @@ async def on_tg_message(event):
             or str(sender_id)
         )
         body = (event.raw_text or "").strip()
-        if not body:
-            return
 
-        log.info(f"📩 de {sender_name} ({sender_id}): {body[:80]}")
+        # ===== FILTRO MODO USERBOT =====
+        # En modo userbot, solo procesar mensajes del dueño (en Saved Messages
+        # o chats donde el dueño es el sender). Esto evita que el userbot
+        # intercepte respuestas de @BotFather u otros bots cuando el dueño
+        # habla con ellos.
+        if _is_userbot_mode and sender_id != _tg_owner_id:
+            # Si hay allowlist Y el sender está en ella, también procesar
+            if not (ALLOWED_TG_IDS is not None and sender_id in ALLOWED_TG_IDS):
+                return  # ignorar silenciosamente
+
+        log.info(f"📩 de {sender_name} ({sender_id}): {body[:80] if body else '(media)'}")
 
         # Verificar allowlist
         if ALLOWED_TG_IDS is not None and sender_id not in ALLOWED_TG_IDS:
             log.warning(f"Usuario no autorizado: {sender_id}")
-            await event.respond("⛔ No estás autorizado para usar este bot.")
+            await event.respond(_render_unauthorized())
             return
 
-        low = body.lower()
+        low = body.lower() if body else ""
 
         if low in ("/start", "hola", "ayuda", "help", "/help"):
-            await event.respond(
-                "🤖 **Bot de subida a S3**\n\n"
-                "Envíame un enlace (http/https) y lo descargaré, "
-                "lo subiré a S3 y te devolveré el archivo + URL.\n\n"
-                "**Comandos:**\n"
-                "/cancel — cancelar tu trabajo\n"
-                "/status — ver estado de tu trabajo"
-            )
+            await event.respond(_render_help(is_userbot=_is_userbot_mode))
             return
 
         if low in ("/cancel", "cancelar"):
             result = await job_queue.cancel_user(sender_id)
             if result == "none":
-                await event.respond("ℹ️ No tienes trabajos activos.")
+                await event.respond(_render_no_active_job())
             else:
-                await event.respond("❌ Cancelado.")
+                await event.respond(_render_cancel())
             return
 
         if low == "/status":
             active = job_queue.has_user_job(sender_id)
             await event.respond(
-                "🔄 Tienes un trabajo en curso." if active
-                else "✅ Sin trabajos activos."
+                _render_active_job() if active else "✓ Sin trabajos activos."
             )
+            return
+
+        if low in ("/sendfile", "/textonly"):
+            if sender_id in _sendfile_users:
+                _sendfile_users.discard(sender_id)
+                await event.respond(_render_sendfile_state(enabled=False))
+            else:
+                _sendfile_users.add(sender_id)
+                await event.respond(_render_sendfile_state(enabled=True))
+            return
+
+        # ===== DETECCIÓN DE MEDIA REENVIADA =====
+        if event.message and event.message.media:
+            if job_queue.has_user_job(sender_id):
+                await event.respond(_render_busy())
+                return
+
+            # Mensaje inicial mínimo: el procesador lo editará después
+            status_msg = await tg_send_status(
+                chat_id, f"{ICON_PROCESSING} Procesando..."
+            )
+            job = QueuedJob(
+                user_id=sender_id, kind="tg_media", url=None,
+                original_name=None,
+                chat_id=chat_id, status_msg=status_msg,
+            )
+            job.message = event.message
+
+            async def _factory():
+                return await process_job(job)
+
+            try:
+                await job_queue.run(job, _factory)
+            except ValueError as e:
+                if "user_already_running" in str(e):
+                    await event.respond(_render_busy())
+                else:
+                    log.exception("job error")
+            except Exception:
+                log.exception("job error")
+            return
+
+        # ===== DETECCIÓN DE URL =====
+        if not body:
+            await event.respond(_render_no_url())
             return
 
         match = URL_RE.search(body)
         if not match:
-            await event.respond("Envía un enlace (http/https) para procesar.")
+            await event.respond(_render_no_url())
             return
 
         if job_queue.has_user_job(sender_id):
-            await event.respond(
-                "⚠️ Ya tienes un trabajo en curso. Usa /cancel para cancelarlo."
-            )
+            await event.respond(_render_busy())
             return
 
         url = match.group(1)
-        # Enviar status inicial primero, luego crear job con ese mensaje
+        # Mensaje inicial mínimo — el procesador lo editará con el progreso
         status_msg = await tg_send_status(
-            chat_id, f"📥 Descargando...\n🔗 `{url[:80]}`"
+            chat_id, f"{ICON_PROCESSING} Procesando..."
         )
         job = QueuedJob(
             user_id=sender_id, kind="url", url=url,
@@ -772,7 +1153,7 @@ async def on_tg_message(event):
             await job_queue.run(job, _factory)
         except ValueError as e:
             if "user_already_running" in str(e):
-                await event.respond("⚠️ Ya tienes un trabajo en curso.")
+                await event.respond(_render_busy())
             else:
                 log.exception("job error")
         except Exception:
@@ -915,6 +1296,9 @@ async def main():
         except FloodWaitError as e:
             _handle_floodwait(e)
             return
+        # Marcar modo userbot para filtrar mensajes
+        global _is_userbot_mode
+        _is_userbot_mode = True
 
     elif TG_BOT_TOKEN:
         # Modo bot oficial con sesión en disco persistente
@@ -958,6 +1342,17 @@ async def main():
     me = await _tg_client.get_me()
     me_name = getattr(me, "username", None) or getattr(me, "first_name", None) or str(me.id)
     log.info(f"✅ Telegram conectado como: {me_name} (id={me.id})")
+
+    # Guardar el ID del dueño (en modo userbot) para filtrar mensajes
+    global _tg_owner_id
+    _tg_owner_id = me.id
+    if _is_userbot_mode:
+        log.info(
+            f"👤 MODO USERBOT activado — solo responderé a mensajes del dueño "
+            f"(id={_tg_owner_id}) o de usuarios en ALLOWED_TG_IDS. "
+            f"Para usar el bot, envíame URLs/archivos a tu chat 'Saved Messages' "
+            f"o a tu propia cuenta."
+        )
 
     # Registrar handler (callback, event)
     # En Telethon: client.add_event_handler(callback, event_type)
