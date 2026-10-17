@@ -1,21 +1,25 @@
 # Bot de Telegram (Telethon) - Subida a S3
 
-Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las sube a S3 y **reenvía el archivo al usuario por Telegram + SIEMPRE muestra la URL pública S3**.
+Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siempre devuelve la URL pública**. Por defecto solo envía la URL como texto (ahorra datos en toDus); con `/sendfile` también reenvía el archivo.
 
 ## ✨ Características
 
-- ✅ **Cliente Telethon** (soporta modo **bot oficial** con `BOT_TOKEN` o modo **userbot** con `SESSION_STRING`)
-- ✅ **La URL S3 siempre se muestra al usuario** (fix principal)
-- ✅ **Protección SSRF**: bloquea IPs privadas/loopback/link-local
+- ✅ **Cliente Telethon** (modo **bot oficial** con `BOT_TOKEN` o **userbot** con `SESSION_STRING`)
+- ✅ **La URL S3 siempre se muestra al usuario**
+- ✅ **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`; Telegram impone su tope físico
+- ✅ **Detección correcta de enlaces con vista previa** (no sube la miniatura)
+- ✅ **Cola por usuario**: los álbumes y envíos seguidos se procesan en orden
+- ✅ **Protección SSRF**: bloquea IPs no globales y valida **cada redirección**
 - ✅ **Allowlist de usuarios** opcional vía `ALLOWED_TG_IDS`
-- ✅ **Event loop no bloqueado**: llamadas síncronas envueltas en `asyncio.to_thread`
-- ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
+- ✅ **Event loop no bloqueado**: descargas/upload en hilos y `asyncio`
+- ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en `Range` y cancela las tareas hermanas
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
-- ✅ **Limpieza de archivos `.part`** en cancelación o fallo
-- ✅ **Envío por Telegram con tipo correcto** (imagen/video/audio/voz/documento)
-- ✅ **SIGTERM handler** para shutdown graceful en Render
-- ✅ **Healthcheck endpoint** en `/health` y `/healthz`
-- ✅ **Watchdog opcional**
+- ✅ **Limpieza de archivos `.part`** incluso al cancelar o fallar
+- ✅ **Envío por Telegram con tipo correcto** (imagen/video/audio/voz/documento) y captions sin Markdown roto
+- ✅ **SIGTERM handler** para shutdown graceful
+- ✅ **Healthchecks** en `/health`, `/healthz` y `/ready`
+- ✅ **Watchdog que no interrumpe trabajos activos**
+- ✅ **Sesión de Telegram fuera de los logs**
 - ✅ **Todas las constantes externalizadas** a variables de entorno
 
 ## 🚀 Deploy en Render
@@ -47,6 +51,8 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 3. **Environment**: Docker.
 4. Render usará el `Dockerfile` incluido.
 
+> **Nota sobre Render free:** el plan free no permite discos persistentes y suspende el servicio tras 15 minutos sin tráfico HTTP. Para un bot de Telegram necesitas un plan siempre encendido o un ping externo. Si usas free, configura `TG_SESSION_STRING` para no repetir el login en cada deploy. Para archivos grandes, usa un plan de pago con disco (ver comentario en `render.yaml`).
+
 ## 🔧 Configuración de Telegram
 
 ### Paso 1: Obtener API_ID y API_HASH
@@ -67,46 +73,26 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 
 #### Opción B: Modo USERBOT (uso con tu cuenta personal)
 
-1. Genera una sesión string ejecutando:
+1. Ejecuta `python scripts/generate_session.py` en tu máquina local.
+2. Sigue las instrucciones (teléfono, código y 2FA si lo tienes).
+3. Guarda el string resultante como `TG_SESSION_STRING`.
 
-```python
-# scripts/generate_session.py
-import asyncio
-from telethon.sessions import StringSession
-from telethon import TelegramClient
+### Paso 2.5: Generar SESSION_STRING para un BOT (sin discos persistentes)
 
-async def main():
-    client = TelegramClient(
-        "session", 
-        api_id=int(input("API_ID: ")),
-        api_hash=input("API_HASH: ")
-    )
-    await client.start(
-        phone=lambda: input("Phone (+53...): "),
-        code_callback=lambda: input("Código: "),
-        password=lambda: input("2FA password (si tienes): ")
-    )
-    print("\n=== GUARDA ESTO ===")
-    print(StringSession.save(client.session))
-    print("===================\n")
-    await client.disconnect()
+Si tu plataforma tiene sistema de archivos efímero (como Render free) y quieres evitar re-logins:
 
-asyncio.run(main())
+1. En **tu máquina local** ejecuta:
+
+```bash
+python scripts/generate_bot_session.py
 ```
 
-2. Guarda el string resultante como `TG_SESSION_STRING`.
+2. Introduce API_ID, API_HASH y el token de @BotFather.
+3. Copia el string que imprime la terminal (no se escribe en los logs del servidor).
+4. Configúralo como `TG_SESSION_STRING`.
+5. Borra `TG_BOT_TOKEN` (o déjalo; `TG_SESSION_STRING` tiene prioridad) y redéploy.
 
-### Paso 2.5: Generar SESSION_STRING para un BOT (alternativa al disco persistente)
-
-Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free) y quieres evitar re-logins, puedes extraer el `SESSION_STRING` después del primer arranque exitoso del bot:
-
-1. Arranca el bot por primera vez con `TG_BOT_TOKEN`.
-2. En los logs verás un mensaje `⚠️ PRIMER LOGIN — guarda este SESSION_STRING...` con un string largo.
-3. Copia ese string y configúralo como variable de entorno `TG_SESSION_STRING`.
-4. Borra `TG_BOT_TOKEN` (o déjalo, `TG_SESSION_STRING` tiene prioridad) y redéploy.
-5. A partir de ahí, el bot usa la sesión string y nunca más necesita re-login.
-
-**Importante:** Esto evita el `FloodWaitError` que ocurre cuando Telegram rate-limita múltiples logins seguidos.
+**Importante:** esto evita el `FloodWaitError` que ocurre cuando Telegram rate-limita múltiples logins seguidos. El bot detecta automáticamente si la sesión es de bot o de usuario, así que una sesión de bot con `SESSION_STRING` sigue funcionando como bot (no activa el filtro de userbot).
 
 ### Paso 3: Obtener tu ID de Telegram (para ALLOWED_TG_IDS)
 
@@ -126,21 +112,25 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `SSRF_BLOCK_PRIVATE` | `1` | Bloquea IPs privadas/loopback |
 | `PORT` | `10000` | Puerto HTTP (Render lo inyecta) |
 | `DOWNLOAD_PATH` | `/tmp/tg_uploads` | Directorio temporal |
-| `MAX_FILE_SIZE_MB` | `2000` | Tamaño máximo de archivo |
-| `TG_UPLOAD_LIMIT_MB` | `2000` | Límite de subida por Telegram |
-| `CHUNK_SIZE_MB` | `16` | Tamaño de chunk |
+| `MAX_FILE_SIZE_MB` | `0` | Tamaño máximo; `0` = **sin límite** (Telegram impone el suyo) |
+| `TG_UPLOAD_LIMIT_MB` | `0` | Comprobación previa al enviar a Telegram; `0` = sin límite |
+| `CHUNK_SIZE_MB` | `8` | Tamaño de chunk de descarga |
+| `DOWNLOAD_TIMEOUT_SECONDS` | `3600` | Tiempo máximo de descarga (no es límite de tamaño) |
+| `UPLOAD_TIMEOUT_SECONDS` | `3600` | Tiempo máximo de subida a S3 (no es límite de tamaño) |
 | `WATCHDOG_ENABLED` | `1` | Activa watchdog |
-| `WATCHDOG_LIFETIME` | `14100` | Segundos antes de reinicio |
+| `WATCHDOG_LIFETIME` | `14100` | Segundos antes de reinicio (espera a que no haya jobs) |
 | `PARALLEL_URL_DOWNLOAD` | `1` | Descarga paralela |
 | `PARALLEL_URL_PARTS` | `4` | Partes paralelas |
-| `ALWAYS_SHOW_S3_URL` | `1` | Mostrar URL S3 siempre |
-| `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). Cambiar a `1` para reenviar archivo. Los usuarios pueden opt-in con `/sendfile` |
+| `PARALLEL_URL_MIN_SIZE_MB` | `50` | Tamaño mínimo para intentar descarga paralela |
+| `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). `1` = reenviar siempre; los usuarios pueden activar con `/sendfile` |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `S3_ENDPOINT` | `https://s3.todus.cu` | Endpoint S3 |
 | `S3_BUCKET` | `stream` | Bucket S3 |
+| `S3_REGION` | `us-east-1` | Región S3 |
 | `S3_UNSIGNED` | `1` | S3 sin firma (toDus) |
 | `S3_ACCESS_KEY` | `public` | Key (si S3_UNSIGNED=0) |
 | `S3_SECRET_KEY` | `public` | Secret (si S3_UNSIGNED=0) |
+| `S3_PUBLIC_BASE_URL` | (vacío) | Base pública opcional (CDN/dominio propio) |
 
 Ver `.env.example` para referencia.
 
@@ -151,7 +141,7 @@ Ver `.env.example` para referencia.
 | `/start`, `hola`, `ayuda`, `help` | Mensaje de ayuda |
 | `/cancel`, `cancelar` | Cancela tu trabajo activo |
 | `/status` | Verifica si tienes trabajo en curso |
-| `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
+| `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF; requiere `SEND_FILE_VIA_TG=1` |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
@@ -164,7 +154,7 @@ Por defecto el bot **SOLO envía la URL S3 como texto**, no reenvía el archivo.
 
 Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo ahorro, escribe `/sendfile` otra vez.
 
-Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`.
+Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`. Si el administrador deja `SEND_FILE_VIA_TG=0`, `/sendfile` responde que el envío está deshabilitado.
 
 ## 🎨 Interfaz minimalista
 
@@ -198,7 +188,7 @@ MP4 · 15.2 MB · nube
 
 ### Mensajes de error
 ```
-✗ Archivo de 3.2 GB — supera el límite de 2.0 GB.
+✗ Archivo de 3.2 GB — Telegram no admite ese tamaño en modo bot.
 ```
 
 ### Comando /help
@@ -266,7 +256,7 @@ https://example.com/archivo.mp4
 ### 2. Reenviar o subir un archivo
 - Reenvía cualquier mensaje que contenga media (foto, video, audio, documento) al bot
 - O sube un archivo directamente desde tu dispositivo al chat del bot
-- El bot lo descarga, lo sube a S3 y te devuelve el archivo + URL
+- El bot lo descarga, lo sube a S3 y te devuelve la URL (y el archivo si tienes `/sendfile` activo)
 
 ### Tipos soportados
 | Tipo | Extensiones |
@@ -280,47 +270,53 @@ https://example.com/archivo.mp4
 ## 🏥 Health endpoints
 
 - `GET /` → `{"status":"online","service":"telegram-s3-bot"}`
-- `GET /health` → estado, uptime, jobs activos, watchdog, tg_connected
+- `GET /health` → estado, uptime, jobs activos/en cola, watchdog, tg_connected
 - `GET /healthz` → alias para Render
+- `GET /ready` → `200` si Telegram está conectado, `503` si no
 
 ## 🛡️ Seguridad
 
-- **SSRF Protection**: bloquea accesos a `127.0.0.1`, `10.x`, `192.168.x`, `169.254.x` (metadata cloud), etc.
-- **Allowlist de IDs**: solo los IDs listados en `ALLOWED_TG_IDS` pueden usar el bot.
-- **Validación de tamaño**: límite configurable por archivo.
-- **Sanitización de nombres**: previene path traversal en archivos temporales.
+- **SSRF Protection**: bloquea IPs no globales (privadas, loopback, link-local, CGNAT) y valida **cada redirección** antes de seguirla.
+- **Allowlist de IDs**: si defines `ALLOWED_TG_IDS`, solo esos IDs pueden usar el bot (en userbot el dueño siempre puede).
+- **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`. Se comprueba el espacio real en disco antes de descargar; Telegram impone su propio tope por archivo.
+- **Sanitización de nombres**: previene path traversal y limita el nombre a 180 bytes.
+- **Sesión fuera de logs**: el `SESSION_STRING` nunca se imprime ni se escribe en disco por el bot.
 
 ## 📝 Notas importantes
 
 ### Sobre el watchdog
-El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 55m). Útil en planes free de Render para evitar fugas de memoria. Desactívalo con `WATCHDOG_ENABLED=0`.
+El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 55m). Si hay trabajos activos, espera hasta 1 hora a que terminen antes de reiniciar. Desactívalo con `WATCHDOG_ENABLED=0`.
 
 ### Sobre el modo bot vs userbot
 - **Modo bot** (recomendado): usa un bot creado con @BotFather. Tiene límites estándar (2GB por archivo) y los usuarios deben iniciar el bot con `/start`. **No intercepta conversaciones con otros bots.**
-- **Modo userbot**: usa tu cuenta personal. Sin límites artificiales pero usa tu cuenta para enviar/recibir. **El bot solo responde a mensajes del dueño** (tú mismo) — pega URLs en tu chat *Saved Messages* para usarlo. No interfiere con tus conversaciones con otros bots o usuarios.
+- **Modo userbot**: usa tu cuenta personal. El bot escucha también tus mensajes salientes **solo en Saved Messages**, y detecta sus propias respuestas para no entrar en bucles. Pega URLs o reenvía archivos ahí. No interfiere con tus conversaciones con otros bots o usuarios.
 
 ### Sobre el S3
 El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cambiarlo a cualquier S3 compatible (AWS, MinIO, Cloudflare R2, etc.) seteando `S3_ENDPOINT`, `S3_BUCKET`, `S3_UNSIGNED=0`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`.
 
 ### Sobre el disco
-- `/tmp/tg_uploads` es efímero en Render (se pierde en cada deploy).
+- `/tmp/tg_uploads` es efímero en Render free (se pierde en cada deploy).
 - Los archivos temporales se eliminan después de subirlos a S3 y enviarlos por Telegram.
-- Si necesitas caché persistente, monta un disco en `render.yaml`.
+- El plan free de Render **no permite discos persistentes**. Para archivos grandes o sesión persistente necesitas un plan de pago con disco (ver el bloque comentado en `render.yaml`).
+- `check_disk_space` usa el tamaño real esperado, no `2 × MAX_FILE_SIZE`.
 
 ## 🐛 Bugs corregidos respecto a la versión original
 
-1. **URL S3 no se mostraba al usuario cuando el envío tenía éxito** → FIX PRINCIPAL
-2. Descarga paralela podía corromper archivos si el servidor ignoraba `Range`
-3. `check_disk_space` no consideraba el espacio extra para descarga paralela
-4. Llamadas síncronas bloqueaban el event loop
-5. Futures huérfanos sin gestionar
-6. Archivos `.part` no se limpiaban en cancelación
-7. Sin protección SSRF
-8. Sin allowlist de usuarios
-9. Sin detección de Content-Type
-10. SIGTERM sin handler registrado
-11. Sin timeout en upload S3
-12. Sesión Telethon no persistente → `FloodWaitError` tras múltiples deploys
+1. **Un enlace con vista previa se trataba como media** y podía subir la miniatura en vez del archivo
+2. **El modo userbot no veía los mensajes de Saved Messages** (`incoming=True` descarta salientes)
+3. **Una sesión de bot con `SESSION_STRING` activaba el filtro de userbot** y dejaba el bot mudo
+4. **SSRF evadible por redirecciones**; ahora se valida cada salto
+5. **`check_disk_space` exigía 2 × MAX_FILE_SIZE** para cualquier archivo
+6. **Tareas huérfanas en descarga paralela** que seguían escribiendo `.part`
+7. **`Accept-Encoding: br` sin Brotli** provocaba errores de decodificación
+8. **El `SESSION_STRING` se escribía en logs y disco**
+9. **Uploads S3 seriales y con `Content-Type: application/octet-stream`**
+10. **El watchdog mataba trabajos activos**
+11. **FloodWait bloqueaba el event loop** y tumbaba el healthcheck
+12. **Álbumes**: solo se procesaba la primera foto
+13. **Markdown roto** en `/help` y captions con nombres especiales
+14. **Nombres de archivo sin truncar** → `ENAMETOOLONG`
+15. **`/sendfile` decía “activado” aunque el administrador lo tuviera desactivado**
 
 ## 🆘 Troubleshooting
 
@@ -333,42 +329,34 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 2. El bot ahora maneja `FloodWaitError` automáticamente: duerme el tiempo indicado y sale limpio. Render lo reiniciará pasado ese tiempo.
 
 **Solución permanente:**
-1. Tras el primer arranque exitoso, copia el `SESSION_STRING` de los logs (mensaje `⚠️ PRIMER LOGIN —`).
-2. Configúralo como variable de entorno `TG_SESSION_STRING`.
-3. A partir de ahí, el bot nunca más hace login contra Telegram → no más FloodWait.
+1. Ejecuta `python scripts/generate_bot_session.py` en tu máquina local.
+2. Copia el string que imprime y configúralo como `TG_SESSION_STRING`.
+3. A partir de ahí, el bot no vuelve a hacer login contra Telegram → no más FloodWait.
 
 ### Sesión se pierde en cada deploy (Render free)
 
-Si no quieres usar `TG_SESSION_STRING`, asegúrate de que:
-1. El disco persistente definido en `render.yaml` está correctamente montado en `/tmp/tg_uploads` (o el valor de `DOWNLOAD_PATH`).
-2. El plan de Render soporta discos persistentes (el plan free los soporta con tamaño máximo 1 GB).
+La forma recomendada es usar `TG_SESSION_STRING`: el plan free de Render no permite discos persistentes y el sistema de archivos se pierde en cada deploy.
 
-El bot guarda la sesión en `DOWNLOAD_PATH/tg_s3_bot.session`. Si ese path es persistente, no necesitas re-login en cada deploy.
+Si usas un plan de pago:
+1. Descomenta el bloque `disk` de `render.yaml` y ajusta `sizeGB`.
+2. Asegúrate de que está montado en `/tmp/tg_uploads` (o tu `DOWNLOAD_PATH`).
+3. El bot guarda la sesión en `DOWNLOAD_PATH/tg_s3_bot.session`; si ese path es persistente, no necesitas re-login.
 
 ### `AttributeError: 'TelegramClient' object has no attribute 'add_handler'`
 
 Esto ya está corregido. El método correcto es `add_event_handler(callback, event)`. Si lo ves, actualiza a la última versión del código.
 
-### El bot responde a cualquier mensaje que recibo en otros bots
+### El bot no responde en modo userbot
 
-**Síntoma:** Estás en modo userbot (`TG_SESSION_STRING` sin `TG_BOT_TOKEN`). Cuando hablas con @BotFather u otro bot y te responden, tu userbot intercepta la respuesta y dice "Envía un enlace...".
+**Síntoma:** Estás en modo userbot (`TG_SESSION_STRING` de una cuenta personal) y el bot no reacciona a lo que escribes.
 
-**Causa:** En modo userbot, el handler `events.NewMessage(incoming=True)` se dispara para **todos** los mensajes entrantes a tu cuenta, incluyendo respuestas de otros bots.
-
-**Solución:** Ya está corregido en la versión actual. El bot ahora:
-1. Detecta automáticamente el modo userbot.
-2. Obtiene tu ID de Telegram tras el login.
-3. Solo procesa mensajes donde `sender_id == tu_id` (tú mismo) o de IDs en `ALLOWED_TG_IDS`.
-4. Ignora silenciosamente todos los demás mensajes (respuestas de otros bots, mensajes de terceros, etc.).
-
-**Cómo usar el bot en modo userbot:**
-- Abre tu chat **Saved Messages** (mensajes guardados) en Telegram.
-- Pega ahí las URLs o reenvía archivos.
-- El bot procesará esos mensajes y responderá en el mismo chat.
-- Tus conversaciones con otros bots/usuarios no se ven afectadas.
-
-Si quieres permitir que otros usuarios usen tu userbot, añade sus IDs a `ALLOWED_TG_IDS`.
+**Comprobaciones:**
+1. Escribe en **Saved Messages** (tu propio chat), no en el chat de otra persona. El bot solo escucha tus mensajes salientes en ese chat.
+2. El mensaje debe contener una URL, ser un archivo/foto/video o un comando (`/start`, `/status`, `/cancel`, `/sendfile`).
+3. El bot ignora sus propias respuestas para no entrar en bucles; si ves un mensaje con `✓`, `⏳`, `✗` o `🤖`, es del bot y no se reprocesa.
+4. En userbot, los mensajes de otros usuarios solo se atienden si están en `ALLOWED_TG_IDS`; el dueño siempre está permitido.
+5. Si usas una sesión de **bot** con `TG_SESSION_STRING`, el bot funciona en modo bot normal (no necesitas Saved Messages).
 
 ## 📄 Licencia
 
-Uso personal/educativo.
+Apache License 2.0 — ver el archivo `LICENSE`.

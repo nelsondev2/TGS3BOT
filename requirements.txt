@@ -1,14 +1,17 @@
 # Telegram S3 Bot - Dependencias
-# Python 3.11+ requerido (usa asyncio.timeout)
+# Python 3.11+ requerido (usa asyncio.timeout y TaskGroup implícito)
 
-# Telethon: cliente de Telegram (soporta modo bot y userbot)
-telethon>=1.36.0
+# Telethon: cliente de Telegram (modo bot y userbot)
+telethon>=1.36,<2
 
 # S3 y descargas
-aioboto3>=13.0.0
-boto3>=1.35.0
-aiohttp>=3.10.0
+boto3>=1.35,<2
+aiohttp>=3.10,<4
 aiofiles>=23.2.1
 
-# Opcional: para generar SESSION_STRING si usas modo userbot
-# tgcrypto>=1.2.5  # acelera cifrado MTPROTO en sistemas con soporte AES-NI
+# Descompresión de respuestas comprimidas (por si un servidor ignora
+# "Accept-Encoding: identity" y devuelve brotli)
+Brotli>=1.1.0
+
+# Opcional: acelera cifrado MTPROTO en sistemas con AES-NI
+# cryptg>=0.4.0

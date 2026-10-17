@@ -1,12 +1,19 @@
 # Render deployment config - Telegram S3 Bot
 # https://render.com/docs/blueprint-spec
-# Crea este servicio en Render como "Web Service" usando "Python" o "Docker".
+#
+# Importante:
+# - El plan free no permite discos persistentes. La sesión de Telethon se
+#   pierde en cada deploy; usa TG_SESSION_STRING (generado con
+#   scripts/generate_bot_session.py) para no repetir el login.
+# - Un Web Service free se suspende tras 15 min sin tráfico HTTP. Si lo usas,
+#   necesitas un ping externo o un plan siempre encendido.
+# - Para archivos grandes necesitas un disco con espacio suficiente:
+#   descomenta el bloque "disk" y usa un plan de pago.
 
 services:
   - type: web
     name: telegram-s3-bot
     runtime: python
-    # Alternativa: runtime: docker (usando el Dockerfile incluido)
     region: oregon  # ajusta según tu región preferida
     plan: free  # free, starter, standard, pro
     branch: main
@@ -14,26 +21,25 @@ services:
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot.py
     healthCheckPath: /health
-    healthCheckTimeout: 60
     autoDeploy: true
-    # Render inyecta automáticamente la variable PORT
+    # Render inyecta automáticamente PORT
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
       # === Telegram (obligatorio) ===
       - key: TG_API_ID
-        sync: false  # setea en panel: https://my.telegram.org/apps
+        sync: false  # https://my.telegram.org/apps
       - key: TG_API_HASH
         sync: false
       # Modo bot:
       - key: TG_BOT_TOKEN
         sync: false  # créalo con @BotFather
-      # O modo userbot (uno de los dos):
+      # O modo userbot / sesión persistente (tiene prioridad):
       - key: TG_SESSION_STRING
         sync: false
       # === Seguridad ===
       - key: ALLOWED_TG_IDS
-        # CSV de IDs autorizados, ej: "123456789,987654321"
+        # CSV de IDs autorizados, ej: "123456789,987654321". Vacío = todos.
         sync: false
       - key: SSRF_BLOCK_PRIVATE
         value: "1"
@@ -46,7 +52,13 @@ services:
         value: "1"
       # === Comportamiento ===
       - key: MAX_FILE_SIZE_MB
-        value: "2000"
+        value: "0"  # 0 = sin límite del bot (Telegram impone el suyo)
+      - key: TG_UPLOAD_LIMIT_MB
+        value: "0"  # 0 = sin comprobación previa
+      - key: DOWNLOAD_TIMEOUT_SECONDS
+        value: "3600"
+      - key: UPLOAD_TIMEOUT_SECONDS
+        value: "3600"
       - key: PARALLEL_URL_DOWNLOAD
         value: "1"
       - key: WATCHDOG_ENABLED
@@ -55,14 +67,11 @@ services:
         value: "14100"
       - key: LOG_LEVEL
         value: "INFO"
-      - key: ALWAYS_SHOW_S3_URL
-        value: "1"
       - key: SEND_FILE_VIA_TG
-        # Por defecto "0" = solo URL S3 (ahorra datos en toDus)
-        # "1" = reenviar archivo + URL S3
-        value: "0"
-    disk:
-      # Disco efímero para descargas temporales
-      name: tmp-downloads
-      mountPath: /tmp/tg_uploads
-      sizeGB: 1
+        value: "0"  # "1" = reenviar archivo + URL (gasta datos)
+    # Disco persistente: solo en planes de pago.
+    # Ajusta sizeGB al tamaño máximo que quieras manejar (deja margen).
+    # disk:
+    #   name: tmp-downloads
+    #   mountPath: /tmp/tg_uploads
+    #   sizeGB: 5
