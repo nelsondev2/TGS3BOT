@@ -17,6 +17,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Compilar
-        run: python -m py_compile bot.py scripts/generate_session.py scripts/generate_bot_session.py
+        run: python -m py_compile bot.py scripts/generate_bot_session.py
       - name: Tests
         run: python -m unittest discover -s tests -v

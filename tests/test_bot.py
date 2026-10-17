@@ -136,15 +136,21 @@ class TestMediaYUI(unittest.TestCase):
     def test_sin_media(self):
         self.assertFalse(bot._is_downloadable_media(SimpleNamespace(media=None)))
 
-    def test_bot_output_y_comandos(self):
+    def test_solo_sesiones_de_bot(self):
+        self.assertTrue(bot._session_is_bot(SimpleNamespace(bot=True)))
+        self.assertFalse(bot._session_is_bot(SimpleNamespace(bot=False)))
+        self.assertFalse(bot._session_is_bot(SimpleNamespace()))
+
+    def test_result_card_y_comandos(self):
         card = bot._render_result_card(
             "archivo", "mp4", 1024, "https://s3.example/stream/x.mp4"
         )
-        self.assertTrue(bot._looks_like_bot_output(card))
-        self.assertTrue(bot._looks_like_bot_output("⏳ Procesando..."))
-        self.assertTrue(bot._looks_like_command("/cancel@MiBot"))
-        self.assertTrue(bot._looks_like_command("hola"))
-        self.assertFalse(bot._looks_like_command("https://example.com/a.mp4"))
+        self.assertIn("https://s3.example/stream/x.mp4", card)
+        self.assertIn("1.0 KB", card)
+        # /cmd@Bot se normaliza al comando sin sufijo.
+        self.assertEqual(bot._command_of("/cancel@MiBot"), "/cancel")
+        self.assertEqual(bot._command_of("  /Start "), "/start")
+        self.assertEqual(bot._command_of("hola"), "hola")
 
 
 class TestCola(unittest.IsolatedAsyncioTestCase):
@@ -411,6 +417,12 @@ class TestSendfileYTextonly(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(12345, bot._sendfile_users)
         self.assertIn("desactivado", event.replies[-1])
 
+    async def test_allowlist_bloquea_a_otros(self):
+        with patch.object(bot, "ALLOWED_TG_IDS", {999}):
+            event = _FakeEvent("/status")
+            await bot.on_tg_message(event)
+        self.assertIn("No estás autorizado", event.replies[-1])
+
     async def test_sendfile_alterna(self):
         bot._sendfile_users.discard(12345)
         with patch.object(bot, "SEND_FILE_VIA_TG", True):
@@ -423,3 +435,73 @@ class TestSendfileYTextonly(unittest.IsolatedAsyncioTestCase):
             await bot.on_tg_message(event)
             self.assertNotIn(12345, bot._sendfile_users)
             self.assertIn("desactivado", event.replies[-1])
+
+
+class _FakeTelegramClient:
+    def __init__(self, *args, **kwargs):
+        self.handlers = []
+        self.disconnected = False
+        self.me = SimpleNamespace(id=42, bot=True, username="mi_bot")
+
+    async def start(self, *args, **kwargs):
+        return self
+
+    async def get_me(self):
+        return self.me
+
+    async def disconnect(self):
+        self.disconnected = True
+
+    def add_event_handler(self, *args, **kwargs):
+        self.handlers.append(args)
+
+    def is_connected(self):
+        return True
+
+
+class TestMainSoloModoBot(unittest.IsolatedAsyncioTestCase):
+    def _patches(self, client):
+        runner = SimpleNamespace(cleanup=unittest.mock.AsyncMock())
+        shutdown = asyncio.Event()
+        shutdown.set()
+        return [
+            patch.object(bot, "TelegramClient", return_value=client),
+            patch.object(bot, "StringSession", side_effect=lambda value: value),
+            patch.object(bot, "TG_SESSION_STRING", "sesion-de-prueba"),
+            patch.object(bot, "TG_BOT_TOKEN", ""),
+            patch.object(bot, "WATCHDOG_ENABLED", False),
+            patch.object(bot, "_setup_signal_handlers", lambda: None),
+            patch.object(bot, "_shutdown_event", shutdown),
+            patch.object(bot, "run_web", new=unittest.mock.AsyncMock(return_value=runner)),
+        ]
+
+    async def test_rechaza_sesion_de_cuenta_personal(self):
+        client = _FakeTelegramClient()
+        client.me = SimpleNamespace(id=42, bot=False, username="persona")
+        patchers = self._patches(client)
+        for p in patchers:
+            p.start()
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                await bot.main()
+        finally:
+            for p in patchers:
+                p.stop()
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(client.handlers, [])
+        self.assertTrue(client.disconnected)
+
+    async def test_arranca_con_sesion_de_bot(self):
+        client = _FakeTelegramClient()
+        patchers = self._patches(client)
+        for p in patchers:
+            p.start()
+        try:
+            await bot.main()
+        finally:
+            for p in patchers:
+                p.stop()
+
+        self.assertEqual(len(client.handlers), 1)
+        self.assertTrue(client.disconnected)

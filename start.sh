@@ -26,9 +26,8 @@ if [ -z "${TG_API_ID:-}" ] || [ -z "${TG_API_HASH:-}" ]; then
 fi
 
 if [ -z "${TG_BOT_TOKEN:-}" ] && [ -z "${TG_SESSION_STRING:-}" ]; then
-    echo "❌ Necesitas TG_BOT_TOKEN (modo bot) o TG_SESSION_STRING (modo userbot)."
-    echo "   Para generar SESSION_STRING: python scripts/generate_session.py"
-    echo "   Para un bot: python scripts/generate_bot_session.py"
+    echo "❌ Necesitas TG_BOT_TOKEN (de @BotFather) o TG_SESSION_STRING de un bot."
+    echo "   Para generar la sesión de bot: python scripts/generate_bot_session.py"
     exit 1
 fi
 

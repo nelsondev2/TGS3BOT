@@ -1,7 +1,7 @@
 # Telegram S3 Bot - Dependencias
 # Python 3.11+ requerido (usa asyncio.timeout y TaskGroup implícito)
 
-# Telethon: cliente de Telegram (modo bot y userbot)
+# Telethon: cliente de Telegram (modo bot)
 telethon>=1.36,<2
 
 # S3 y descargas

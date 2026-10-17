@@ -8,11 +8,12 @@ Flujo:
 4. Devuelve SIEMPRE la URL pública S3.
 5. Opcionalmente reenvía el archivo por Telegram (/sendfile).
 
-Modos:
-- Bot oficial: TG_API_ID + TG_API_HASH + TG_BOT_TOKEN.
-- Userbot: TG_API_ID + TG_API_HASH + TG_SESSION_STRING de una cuenta personal.
-  En userbot solo se atienden los mensajes del dueño en Saved Messages y, si se
-  configura ALLOWED_TG_IDS, también los de esos usuarios.
+Modo único: bot oficial.
+- TG_API_ID + TG_API_HASH + TG_BOT_TOKEN (login directo), o
+- TG_API_ID + TG_API_HASH + TG_SESSION_STRING de un BOT (generado con
+  scripts/generate_bot_session.py) para evitar re-logins en hosts efímeros.
+- Se rechazan las sesiones de cuentas personales: este bot solo funciona con
+  cuentas de bot.
 
 Notas de esta versión:
 - Sin límite de tamaño por defecto (MAX_FILE_SIZE_MB=0 y TG_UPLOAD_LIMIT_MB=0).
@@ -208,15 +209,8 @@ def _get_s3_client():
 START_TIME = time.time()
 _shutdown_event = asyncio.Event()
 _tg_client = None
-_tg_owner_id = None
-_is_userbot_mode = False
 _watchdog_task = None
 _floodwait_active = False
-
-# IDs de mensajes enviados por el bot. En modo userbot sirven para no procesar
-# sus propias respuestas (lo que provocaría bucles).
-_bot_message_ids = set()
-_bot_message_order = deque(maxlen=2000)
 
 # Margen de disco que nunca se toca (para que el sistema respire).
 DISK_MARGIN = 64 * 1024 * 1024
@@ -384,33 +378,17 @@ def _is_downloadable_media(message):
     return isinstance(media, (MessageMediaPhoto, MessageMediaDocument))
 
 
+def _session_is_bot(me):
+    """True si la sesión conectada es de un bot (no de una cuenta personal)."""
+    return bool(getattr(me, "bot", False))
+
+
 def _command_of(text):
     """Devuelve el primer token normalizado (/cmd@Bot -> /cmd)."""
     first = (text or "").strip().split(maxsplit=1)[0].lower() if text else ""
     if first.startswith("/") and "@" in first:
         first = first.split("@", 1)[0]
     return first
-
-
-def _looks_like_command(text):
-    low = (text or "").strip().lower()
-    command = _command_of(low)
-    return command in {
-        "/start", "/help", "/cancel", "/cancelar", "/status",
-        "/sendfile", "/textonly",
-    } or low in ("hola", "ayuda", "help", "cancelar")
-
-
-BOT_OUTPUT_PREFIXES = (
-    "⏳", "✓", "✗", "⊘", "🤖",
-    "No tienes", "Envía un enlace", "No estás autorizado",
-    "Modo archivo", "En cola",
-)
-
-
-def _looks_like_bot_output(text):
-    text = (text or "").lstrip()
-    return any(text.startswith(prefix) for prefix in BOT_OUTPUT_PREFIXES)
 
 
 # ============== SSRF PROTECTION ==============
@@ -756,7 +734,7 @@ def _render_cancel():
     return f"{ICON_CANCEL} Cancelado"
 
 
-def _render_help(is_userbot=False, sendfile_enabled=True):
+def _render_help(sendfile_enabled=True):
     lines = [
         "🤖 Bot S3 — sube archivos a la nube y te devuelve el enlace",
         "",
@@ -779,12 +757,6 @@ def _render_help(is_userbot=False, sendfile_enabled=True):
     if not sendfile_enabled:
         lines.append("")
         lines.append("El envío de archivos por Telegram está desactivado por el administrador.")
-    if is_userbot:
-        lines.extend([
-            "",
-            "👤 Modo userbot: solo respondo a mensajes del dueño.",
-            "Pega enlaces o reenvía archivos en Saved Messages para usar el bot.",
-        ])
     return "\n".join(lines)
 
 
@@ -829,24 +801,12 @@ def _tipo_label(tipo):
 
 
 # ============== TELEGRAM HELPERS ==============
-def _mark_bot_message(msg):
-    msg_id = getattr(msg, "id", None)
-    if msg_id is None:
-        return
-    if len(_bot_message_order) == _bot_message_order.maxlen:
-        old = _bot_message_order.popleft()
-        _bot_message_ids.discard(old)
-    _bot_message_order.append(msg_id)
-    _bot_message_ids.add(msg_id)
-
-
 async def tg_send_status(chat_id, text):
     global _tg_client
     if _tg_client is None:
         return None
     try:
         msg = await _tg_client.send_message(chat_id, text)
-        _mark_bot_message(msg)
         return msg
     except FloodWaitError as e:
         log.warning("tg_send_status FloodWait %ss", e.seconds)
@@ -877,7 +837,6 @@ async def tg_edit_status(chat_id, msg, text):
 async def _respond(event, text):
     try:
         msg = await event.respond(text)
-        _mark_bot_message(msg)
         return msg
     except FloodWaitError as e:
         log.warning("respond FloodWait %ss", e.seconds)
@@ -905,29 +864,24 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
     ext = os.path.splitext(filename)[1].lower()
     try:
         if ext in IMAGE_EXT:
-            msg = await _tg_client.send_file(chat_id, file=file_path, caption=caption)
-            _mark_bot_message(msg)
+            await _tg_client.send_file(chat_id, file=file_path, caption=caption)
             return "imagen", None
         if ext in VIDEO_EXT:
-            msg = await _tg_client.send_file(
+            await _tg_client.send_file(
                 chat_id, file=file_path, caption=caption, supports_streaming=True
             )
-            _mark_bot_message(msg)
             return "video", None
         if ext in VOICE_EXT:
-            msg = await _tg_client.send_file(
+            await _tg_client.send_file(
                 chat_id, file=file_path, caption=caption, voice_note=True
             )
-            _mark_bot_message(msg)
             return "nota de voz", None
         if ext in AUDIO_EXT:
-            msg = await _tg_client.send_file(chat_id, file=file_path, caption=caption)
-            _mark_bot_message(msg)
+            await _tg_client.send_file(chat_id, file=file_path, caption=caption)
             return "audio", None
-        msg = await _tg_client.send_file(
+        await _tg_client.send_file(
             chat_id, file=file_path, caption=caption, force_document=True
         )
-        _mark_bot_message(msg)
         return "archivo", None
     except FloodWaitError as e:
         log.warning("send_file FloodWait %ss", e.seconds)
@@ -1436,8 +1390,6 @@ async def on_tg_message(event):
         chat_id = event.chat_id
         sender = await event.get_sender()
         sender_id = sender.id if sender else None
-        if sender_id is None and getattr(event.message, "out", False):
-            sender_id = _tg_owner_id
         sender_name = (
             getattr(sender, "username", None)
             or getattr(sender, "first_name", None)
@@ -1445,18 +1397,9 @@ async def on_tg_message(event):
         )
         body = (event.raw_text or "").strip()
 
-        # En modo userbot solo se atiende al dueño y, si hay allowlist, a esos IDs.
-        if _is_userbot_mode and sender_id != _tg_owner_id:
-            if not (ALLOWED_TG_IDS is not None and sender_id in ALLOWED_TG_IDS):
-                return
-
         log.info("📩 de %s (%s): %s", sender_name, sender_id, _redact_text(body))
 
-        if (
-            ALLOWED_TG_IDS is not None
-            and sender_id != _tg_owner_id
-            and sender_id not in ALLOWED_TG_IDS
-        ):
+        if ALLOWED_TG_IDS is not None and sender_id not in ALLOWED_TG_IDS:
             log.warning("Usuario no autorizado: %s", sender_id)
             await _respond(event, _render_unauthorized())
             return
@@ -1467,10 +1410,7 @@ async def on_tg_message(event):
         if command in ("/start", "/help") or low in ("hola", "ayuda", "help"):
             await _respond(
                 event,
-                _render_help(
-                    is_userbot=_is_userbot_mode,
-                    sendfile_enabled=SEND_FILE_VIA_TG,
-                ),
+                _render_help(sendfile_enabled=SEND_FILE_VIA_TG),
             )
             return
 
@@ -1553,32 +1493,6 @@ async def on_tg_message(event):
 
     except Exception as e:
         log.exception("on_tg_message: %s", e)
-
-
-async def on_tg_own_message(event):
-    """En modo userbot procesa los mensajes que el dueño escribe en Saved Messages.
-
-    Se ignora todo lo que haya enviado el propio bot para no entrar en bucles.
-    """
-    if not _is_userbot_mode:
-        return
-    if event.chat_id != _tg_owner_id:
-        return
-    msg_id = getattr(event.message, "id", None)
-    if msg_id in _bot_message_ids:
-        return
-
-    text = (event.raw_text or "").strip()
-    if _looks_like_bot_output(text):
-        return
-    if not (
-        _is_downloadable_media(event.message)
-        or URL_RE.search(text)
-        or _looks_like_command(text)
-    ):
-        return
-
-    await on_tg_message(event)
 
 
 # ============== WEB SERVER (healthcheck) ==============
@@ -1702,7 +1616,7 @@ async def _handle_floodwait(e: FloodWaitError):
 
 # ============== MAIN ==============
 async def main():
-    global _tg_client, _tg_owner_id, _is_userbot_mode, _watchdog_task
+    global _tg_client, _watchdog_task
 
     if not TG_API_ID or not TG_API_HASH:
         log.error(
@@ -1726,7 +1640,7 @@ async def main():
         session_path = os.path.join(DOWNLOAD_PATH, "tg_s3_bot.session")
 
         if TG_SESSION_STRING:
-            log.info("🔗 Usando TG_SESSION_STRING pre-generada (sin re-login)")
+            log.info("🔗 Usando TG_SESSION_STRING de bot (sin re-login)")
             _tg_client = TelegramClient(
                 StringSession(TG_SESSION_STRING),
                 api_id=TG_API_ID,
@@ -1765,23 +1679,23 @@ async def main():
             or getattr(me, "first_name", None)
             or str(me.id)
         )
-        _tg_owner_id = me.id
-        _is_userbot_mode = not bool(getattr(me, "bot", False))
+        # Solo modo bot: una sesión de cuenta personal abre la cuenta entera a
+        # cualquiera que use el bot, así que se rechaza explícitamente.
+        if not _session_is_bot(me):
+            log.error(
+                "❌ La sesión configurada es de una cuenta personal (id=%s), no "
+                "de un bot. Este bot solo funciona en modo bot: usa "
+                "TG_BOT_TOKEN o un TG_SESSION_STRING generado con "
+                "scripts/generate_bot_session.py.",
+                me.id,
+            )
+            raise SystemExit(1)
 
-        mode = "USERBOT" if _is_userbot_mode else "BOT"
-        log.info("✅ Telegram conectado como: %s (id=%s, modo=%s)", me_name, me.id, mode)
+        log.info("✅ Telegram conectado como bot: %s (id=%s)", me_name, me.id)
 
         _tg_client.add_event_handler(
             on_tg_message, events.NewMessage(incoming=True)
         )
-        if _is_userbot_mode:
-            _tg_client.add_event_handler(
-                on_tg_own_message, events.NewMessage(outgoing=True)
-            )
-            log.info(
-                "👤 Modo userbot: atiendo mensajes del dueño en Saved Messages "
-                "y de usuarios en ALLOWED_TG_IDS."
-            )
 
         if ALLOWED_TG_IDS is not None:
             log.info("Allowlist activa: %s IDs", len(ALLOWED_TG_IDS))

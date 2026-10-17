@@ -34,7 +34,7 @@ services:
       # Modo bot:
       - key: TG_BOT_TOKEN
         sync: false  # créalo con @BotFather
-      # O modo userbot / sesión persistente (tiene prioridad):
+      # Sesión de BOT pre-generada (opcional; tiene prioridad sobre el token):
       - key: TG_SESSION_STRING
         sync: false
       # === Seguridad ===

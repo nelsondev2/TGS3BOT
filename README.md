@@ -4,7 +4,7 @@ Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siem
 
 ## ✨ Características
 
-- ✅ **Cliente Telethon** (modo **bot oficial** con `BOT_TOKEN` o **userbot** con `SESSION_STRING`)
+- ✅ **Cliente Telethon en modo bot oficial** (`TG_BOT_TOKEN`, o `TG_SESSION_STRING` de un bot)
 - ✅ **La URL S3 siempre se muestra al usuario**
 - ✅ **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`; Telegram impone su tope físico
 - ✅ **Detección correcta de enlaces con vista previa** (no sube la miniatura)
@@ -31,7 +31,7 @@ Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siem
 3. Selecciona tu repo. Render detectará `render.yaml` automáticamente.
 4. Configura las variables sensibles en el panel:
    - `TG_API_ID` y `TG_API_HASH` (de https://my.telegram.org/apps)
-   - `TG_BOT_TOKEN` (de @BotFather) **o** `TG_SESSION_STRING` (modo userbot)
+   - `TG_BOT_TOKEN` (de @BotFather) **o** `TG_SESSION_STRING` de un bot (opcional, evita re-logins)
    - `ALLOWED_TG_IDS` (CSV de IDs autorizados)
 
 ### Opción 2: Web Service manual
@@ -62,20 +62,14 @@ Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siem
 3. Crea una nueva app (los campos son informativos).
 4. Copia el `api_id` y `api_hash`.
 
-### Paso 2: Elegir modo de operación
+### Paso 2: Crear el bot en @BotFather
 
-#### Opción A: Modo BOT (recomendado para producción)
+El bot funciona **únicamente en modo bot** (cuentas personales no están soportadas).
 
 1. En Telegram, habla con **@BotFather**.
 2. Envía `/newbot` y sigue las instrucciones.
 3. Copia el token que te da (formato `123456789:ABCDefgh...`).
 4. Configúralo como `TG_BOT_TOKEN`.
-
-#### Opción B: Modo USERBOT (uso con tu cuenta personal)
-
-1. Ejecuta `python scripts/generate_session.py` en tu máquina local.
-2. Sigue las instrucciones (teléfono, código y 2FA si lo tienes).
-3. Guarda el string resultante como `TG_SESSION_STRING`.
 
 ### Paso 2.5: Generar SESSION_STRING para un BOT (sin discos persistentes)
 
@@ -92,7 +86,7 @@ python scripts/generate_bot_session.py
 4. Configúralo como `TG_SESSION_STRING`.
 5. Borra `TG_BOT_TOKEN` (o déjalo; `TG_SESSION_STRING` tiene prioridad) y redéploy.
 
-**Importante:** esto evita el `FloodWaitError` que ocurre cuando Telegram rate-limita múltiples logins seguidos. El bot detecta automáticamente si la sesión es de bot o de usuario, así que una sesión de bot con `SESSION_STRING` sigue funcionando como bot (no activa el filtro de userbot).
+**Importante:** esto evita el `FloodWaitError` que ocurre cuando Telegram rate-limita múltiples logins seguidos. El bot **rechaza** las sesiones de cuentas personales al arrancar: solo acepta sesiones generadas con `scripts/generate_bot_session.py` (o el login directo con `TG_BOT_TOKEN`).
 
 ### Paso 3: Obtener tu ID de Telegram (para ALLOWED_TG_IDS)
 
@@ -107,7 +101,7 @@ python scripts/generate_bot_session.py
 | `TG_API_ID` | (vacío) | API ID de https://my.telegram.org/apps |
 | `TG_API_HASH` | (vacío) | API HASH de https://my.telegram.org/apps |
 | `TG_BOT_TOKEN` | (vacío) | Token del bot (@BotFather) |
-| `TG_SESSION_STRING` | (vacío) | Sesión pre-generada (modo userbot) |
+| `TG_SESSION_STRING` | (vacío) | Sesión pre-generada **de un bot** (opcional; evita re-logins) |
 | `ALLOWED_TG_IDS` | (vacío = todos) | CSV de IDs autorizados |
 | `SSRF_BLOCK_PRIVATE` | `1` | Bloquea IPs privadas/loopback |
 | `PORT` | `10000` | Puerto HTTP (Render lo inyecta) |
@@ -277,7 +271,7 @@ https://example.com/archivo.mp4
 ## 🛡️ Seguridad
 
 - **SSRF Protection**: bloquea IPs no globales (privadas, loopback, link-local, CGNAT) y valida **cada redirección** antes de seguirla.
-- **Allowlist de IDs**: si defines `ALLOWED_TG_IDS`, solo esos IDs pueden usar el bot (en userbot el dueño siempre puede).
+- **Allowlist de IDs**: si defines `ALLOWED_TG_IDS`, solo esos IDs pueden usar el bot. Sin la variable, cualquiera que hable con el bot puede usarlo.
 - **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`. Se comprueba el espacio real en disco antes de descargar; Telegram impone su propio tope por archivo.
 - **Sanitización de nombres**: previene path traversal y limita el nombre a 180 bytes.
 - **Sesión fuera de logs**: el `SESSION_STRING` nunca se imprime ni se escribe en disco por el bot.
@@ -287,9 +281,11 @@ https://example.com/archivo.mp4
 ### Sobre el watchdog
 El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 55m). Si hay trabajos activos, espera hasta 1 hora a que terminen antes de reiniciar. Desactívalo con `WATCHDOG_ENABLED=0`.
 
-### Sobre el modo bot vs userbot
-- **Modo bot** (recomendado): usa un bot creado con @BotFather. Tiene límites estándar (2GB por archivo) y los usuarios deben iniciar el bot con `/start`. **No intercepta conversaciones con otros bots.**
-- **Modo userbot**: usa tu cuenta personal. El bot escucha también tus mensajes salientes **solo en Saved Messages**, y detecta sus propias respuestas para no entrar en bucles. Pega URLs o reenvía archivos ahí. No interfiere con tus conversaciones con otros bots o usuarios.
+### Sobre el modo bot
+- El bot funciona **solo como bot** creado con @BotFather (o una sesión de bot pre-generada).
+- Tiene los límites estándar de Telegram (2 GB por archivo) y los usuarios deben iniciar el bot con `/start`.
+- **No intercepta conversaciones** con otros bots ni con otras personas.
+- Si configuras por error `TG_SESSION_STRING` de una cuenta personal, el bot lo detecta al conectar y **se niega a arrancar** en lugar de exponer tu cuenta.
 
 ### Sobre el S3
 El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cambiarlo a cualquier S3 compatible (AWS, MinIO, Cloudflare R2, etc.) seteando `S3_ENDPOINT`, `S3_BUCKET`, `S3_UNSIGNED=0`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`.
@@ -303,20 +299,19 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 ## 🐛 Bugs corregidos respecto a la versión original
 
 1. **Un enlace con vista previa se trataba como media** y podía subir la miniatura en vez del archivo
-2. **El modo userbot no veía los mensajes de Saved Messages** (`incoming=True` descarta salientes)
-3. **Una sesión de bot con `SESSION_STRING` activaba el filtro de userbot** y dejaba el bot mudo
-4. **SSRF evadible por redirecciones**; ahora se valida cada salto
-5. **`check_disk_space` exigía 2 × MAX_FILE_SIZE** para cualquier archivo
-6. **Tareas huérfanas en descarga paralela** que seguían escribiendo `.part`
-7. **`Accept-Encoding: br` sin Brotli** provocaba errores de decodificación
-8. **El `SESSION_STRING` se escribía en logs y disco**
-9. **Uploads S3 seriales y con `Content-Type: application/octet-stream`**
-10. **El watchdog mataba trabajos activos**
-11. **FloodWait bloqueaba el event loop** y tumbaba el healthcheck
-12. **Álbumes**: solo se procesaba la primera foto
-13. **Markdown roto** en `/help` y captions con nombres especiales
-14. **Nombres de archivo sin truncar** → `ENAMETOOLONG`
-15. **`/sendfile` decía “activado” aunque el administrador lo tuviera desactivado**
+2. **SSRF evadible por redirecciones**; ahora se valida cada salto
+3. **`check_disk_space` exigía 2 × MAX_FILE_SIZE** para cualquier archivo
+4. **Tareas huérfanas en descarga paralela** que seguían escribiendo `.part`
+5. **`Accept-Encoding: br` sin Brotli** provocaba errores de decodificación
+6. **El `SESSION_STRING` se escribía en logs y disco**
+7. **Uploads S3 seriales y con `Content-Type: application/octet-stream`**
+8. **El watchdog mataba trabajos activos**
+9. **FloodWait bloqueaba el event loop** y tumbaba el healthcheck
+10. **Álbumes**: solo se procesaba la primera foto
+11. **Markdown roto** en `/help` y captions con nombres especiales
+12. **Nombres de archivo sin truncar** → `ENAMETOOLONG`
+13. **`/sendfile` decía “activado” aunque el administrador lo tuviera desactivado**
+14. **`/textonly` activaba el modo archivo** en vez de desactivarlo (era un alias del toggle)
 
 ## 🆘 Troubleshooting
 
@@ -346,16 +341,14 @@ Si usas un plan de pago:
 
 Esto ya está corregido. El método correcto es `add_event_handler(callback, event)`. Si lo ves, actualiza a la última versión del código.
 
-### El bot no responde en modo userbot
-
-**Síntoma:** Estás en modo userbot (`TG_SESSION_STRING` de una cuenta personal) y el bot no reacciona a lo que escribes.
+### El bot no responde
 
 **Comprobaciones:**
-1. Escribe en **Saved Messages** (tu propio chat), no en el chat de otra persona. El bot solo escucha tus mensajes salientes en ese chat.
+1. Abre el chat del bot e inícialo con `/start`; los bots no pueden escribir primero.
 2. El mensaje debe contener una URL, ser un archivo/foto/video o un comando (`/start`, `/status`, `/cancel`, `/sendfile`).
-3. El bot ignora sus propias respuestas para no entrar en bucles; si ves un mensaje con `✓`, `⏳`, `✗` o `🤖`, es del bot y no se reprocesa.
-4. En userbot, los mensajes de otros usuarios solo se atienden si están en `ALLOWED_TG_IDS`; el dueño siempre está permitido.
-5. Si usas una sesión de **bot** con `TG_SESSION_STRING`, el bot funciona en modo bot normal (no necesitas Saved Messages).
+3. Si defines `ALLOWED_TG_IDS`, tu ID tiene que estar en la lista o el bot responderá “No estás autorizado”.
+4. Revisa los logs: si aparece “La sesión configurada es de una cuenta personal”, sustituye `TG_SESSION_STRING` por uno generado con `scripts/generate_bot_session.py` o borra esa variable y usa `TG_BOT_TOKEN`.
+5. Si usas Render free, el servicio se suspende sin tráfico; el primer mensaje puede tardar ~1 minuto en arrancar.
 
 ## 📄 Licencia
 
