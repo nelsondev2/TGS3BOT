@@ -5,8 +5,10 @@ Flujo:
 1. El usuario envía una URL o reenvía un archivo por Telegram.
 2. El bot descarga el archivo (secuencial o paralelo).
 3. Lo sube a S3 (toDus S3 o cualquier S3 configurable).
-4. Devuelve SIEMPRE la URL pública S3.
-5. Opcionalmente reenvía el archivo por Telegram (/sendfile).
+4. Devuelve SIEMPRE la URL pública S3 como mensaje de texto.
+
+El bot no reenvía archivos por Telegram: solo entrega el enlace. Así el
+usuario decide cuándo descarga y no se transfieren datos de más.
 
 Modo único: bot oficial.
 - TG_API_ID + TG_API_HASH + TG_BOT_TOKEN (login directo), o
@@ -16,8 +18,8 @@ Modo único: bot oficial.
   cuentas de bot.
 
 Notas de esta versión:
-- Sin límite de tamaño por defecto (MAX_FILE_SIZE_MB=0 y TG_UPLOAD_LIMIT_MB=0).
-  Telegram sigue imponiendo su límite físico por archivo.
+- Sin límite de tamaño por defecto (MAX_FILE_SIZE_MB=0). El tamaño solo
+  está limitado por el disco y por lo que permita la fuente del archivo.
 - Detección correcta de mensajes con vista previa (MessageMediaWebPage).
 - Cola por usuario: los álbumes y los envíos seguidos no se pierden.
 - SSRF con validación de redirecciones y de todas las IPs resueltas.
@@ -121,10 +123,8 @@ PORT = _env_int("PORT", 10000, minimum=1)
 
 # --- Descarga ---
 DOWNLOAD_PATH = os.environ.get("DOWNLOAD_PATH", "/tmp/tg_uploads").strip() or "/tmp/tg_uploads"
-# 0 = sin límite de tamaño (solo lo que imponga Telegram / el disco).
+# 0 = sin límite de tamaño (solo lo limita el disco de la máquina).
 MAX_FILE_SIZE = _env_int("MAX_FILE_SIZE_MB", 0, minimum=0) * 1024 * 1024
-# 0 = sin comprobación previa de subida a Telegram (Telegram impone su tope).
-TG_UPLOAD_LIMIT = _env_int("TG_UPLOAD_LIMIT_MB", 0, minimum=0) * 1024 * 1024
 CHUNK_SIZE = _env_int("CHUNK_SIZE_MB", 8, minimum=1) * 1024 * 1024
 # Tiempos máximos para archivos grandes. No son límites de tamaño.
 DOWNLOAD_TIMEOUT = _env_int("DOWNLOAD_TIMEOUT_SECONDS", 3600, minimum=1)
@@ -141,11 +141,6 @@ PARALLEL_URL_MIN_SIZE = _env_int("PARALLEL_URL_MIN_SIZE_MB", 50, minimum=0) * 10
 
 # --- Seguridad ---
 SSRF_BLOCK_PRIVATE = _env_bool("SSRF_BLOCK_PRIVATE", True)
-
-# --- Comportamiento ---
-# Por defecto solo se envía la URL S3 como texto: no se transfiere el archivo
-# por Telegram; la descarga desde S3 se descuenta del plan de toDus.
-SEND_FILE_VIA_TG = _env_bool("SEND_FILE_VIA_TG", False)
 
 # --- HTTP Headers ---
 # "identity" evita que el servidor comprima la respuesta y rompa los rangos.
@@ -230,11 +225,6 @@ def format_size(b):
 
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)", re.IGNORECASE)
-
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".3gp"}
-AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
-VOICE_EXT = {".ogg", ".opus"}
 
 CONTENT_TYPE_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -735,7 +725,7 @@ def _render_cancel():
     return f"{ICON_CANCEL} Cancelado"
 
 
-def _render_help(sendfile_enabled=True):
+def _render_help():
     lines = [
         "🤖 Bot S3 — sube archivos a la nube y te devuelve el enlace",
         "",
@@ -743,42 +733,16 @@ def _render_help(sendfile_enabled=True):
         "  • Envía un enlace http(s)://... y lo subo",
         "  • Reenvía un archivo (foto, video, audio, doc) y lo subo",
         "",
-        "Por defecto solo te envío la URL como texto (no se transfiere el archivo).",
-        "Descargarlo desde S3 consume datos de toDus; recibirlo por Telegram, datos",
-        "de tu plan de internet.",
-        "Si quieres recibir el archivo además de la URL, usa /sendfile.",
+        "Siempre te devuelvo solo el enlace: no reenvío el archivo.",
+        "Descargarlo consume datos de toDus, así que tú decides cuándo hacerlo.",
         "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
-        "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
-        "  /textonly — desactivar el envío del archivo (solo URL)",
         "",
-        "El bot no impone límite de tamaño; Telegram sí limita cada archivo",
-        "(2 GB por archivo en modo bot).",
+        "El bot no impone límite de tamaño; solo el espacio en disco.",
     ]
-    if not sendfile_enabled:
-        lines.append("")
-        lines.append("El envío de archivos por Telegram está desactivado por el administrador.")
     return "\n".join(lines)
-
-
-def _render_sendfile_state(enabled, available=True):
-    if not available:
-        return (
-            f"{ICON_ERROR} El envío de archivos está desactivado por el administrador.\n\n"
-            "Solo recibirás la URL S3."
-        )
-    if enabled:
-        return (
-            f"{ICON_DONE} Modo archivo activado\n\n"
-            "A partir de ahora recibirás el archivo además de la URL "
-            "(consume datos de Telegram)."
-        )
-    return (
-        f"{ICON_DONE} Modo archivo desactivado\n\n"
-        "Solo recibirás la URL S3 (no se transfiere el archivo)."
-    )
 
 
 def _render_unauthorized():
@@ -791,17 +755,6 @@ def _render_no_active_job():
 
 def _render_no_url():
     return "Envía un enlace (http/https) o reenvía un archivo para procesar."
-
-
-def _tipo_label(tipo):
-    labels = {
-        "imagen": "foto",
-        "video": "video",
-        "audio": "audio",
-        "nota de voz": "nota de voz",
-        "archivo": "documento",
-    }
-    return labels.get(tipo, tipo)
 
 
 # ============== TELEGRAM HELPERS ==============
@@ -847,52 +800,6 @@ async def _respond(event, text):
     except Exception as e:
         log.warning("respond falló: %s", e)
     return None
-
-
-async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
-    """Envía un archivo por Telegram con el tipo correcto.
-
-    Devuelve (tipo_str, error_str).
-    """
-    global _tg_client
-    if not SEND_FILE_VIA_TG:
-        return None, "envío por TG desactivado"
-    if TG_UPLOAD_LIMIT > 0 and size > TG_UPLOAD_LIMIT:
-        return None, (
-            f"archivo {format_size(size)} supera el límite configurado "
-            f"{format_size(TG_UPLOAD_LIMIT)}"
-        )
-    if _tg_client is None:
-        return None, "cliente de Telegram no disponible"
-
-    ext = os.path.splitext(filename)[1].lower()
-    try:
-        if ext in IMAGE_EXT:
-            await _tg_client.send_file(chat_id, file=file_path, caption=caption)
-            return "imagen", None
-        if ext in VIDEO_EXT:
-            await _tg_client.send_file(
-                chat_id, file=file_path, caption=caption, supports_streaming=True
-            )
-            return "video", None
-        if ext in VOICE_EXT:
-            await _tg_client.send_file(
-                chat_id, file=file_path, caption=caption, voice_note=True
-            )
-            return "nota de voz", None
-        if ext in AUDIO_EXT:
-            await _tg_client.send_file(chat_id, file=file_path, caption=caption)
-            return "audio", None
-        await _tg_client.send_file(
-            chat_id, file=file_path, caption=caption, force_document=True
-        )
-        return "archivo", None
-    except FloodWaitError as e:
-        log.warning("send_file FloodWait %ss", e.seconds)
-        return None, f"Telegram pidió esperar {e.seconds}s"
-    except Exception as e:
-        log.warning("No se pudo enviar archivo a %s: %s", chat_id, e)
-        return None, str(e)[:200]
 
 
 # ============== S3 UPLOAD ==============
@@ -1075,7 +982,7 @@ async def _download_parallel(session, url, temp_path, total, job):
 
 # ============== PROCESAMIENTO ==============
 async def _deliver(job, temp_path, filename, source):
-    """Sube a S3 y entrega la URL (y el archivo si el usuario lo pidió)."""
+    """Sube a S3 y entrega únicamente la URL pública como texto."""
     chat_id = job.chat_id
     status_msg = job.status_msg
     size = os.path.getsize(temp_path)
@@ -1095,26 +1002,9 @@ async def _deliver(job, temp_path, filename, source):
         name=name, ext=ext_out, size=size, s3_url=url_final, source=source
     )
 
-    send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
-    if not send_file:
-        await tg_edit_status(chat_id, status_msg, card)
-        log.info("OK subido a S3 (textonly) para %s: %s", chat_id, filename)
-        return
-
-    tipo, send_err = await _send_file_via_telegram(
-        chat_id, temp_path, filename, size, card
-    )
-    if tipo:
-        log.info("OK enviado %s a %s: %s", tipo, chat_id, filename)
-        await tg_edit_status(
-            chat_id, status_msg,
-            f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}",
-        )
-    else:
-        err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
-        await tg_edit_status(
-            chat_id, status_msg, card + f"\n\n{_render_error(err_msg)}"
-        )
+    # Siempre solo el enlace: el bot nunca reenvía el archivo por Telegram.
+    await tg_edit_status(chat_id, status_msg, card)
+    log.info("OK subido a S3 para %s: %s", chat_id, filename)
 
 
 async def process_job(job):
@@ -1386,9 +1276,6 @@ async def _process_url(job):
 
 
 # ============== TELEGRAM EVENT HANDLERS ==============
-_sendfile_users = set()
-
-
 async def on_tg_message(event):
     try:
         chat_id = event.chat_id
@@ -1412,10 +1299,7 @@ async def on_tg_message(event):
         command = _command_of(low)
 
         if command in ("/start", "/help") or low in ("hola", "ayuda", "help"):
-            await _respond(
-                event,
-                _render_help(sendfile_enabled=SEND_FILE_VIA_TG),
-            )
+            await _respond(event, _render_help())
             return
 
         if command in ("/cancel", "/cancelar") or low == "cancelar":
@@ -1437,21 +1321,6 @@ async def on_tg_message(event):
             else:
                 text = "✓ Sin trabajos activos."
             await _respond(event, text)
-            return
-
-        if command in ("/sendfile", "/textonly"):
-            if not SEND_FILE_VIA_TG:
-                await _respond(
-                    event, _render_sendfile_state(False, available=False)
-                )
-                return
-            # /textonly siempre desactiva (idempotente); /sendfile alterna.
-            if command == "/textonly" or sender_id in _sendfile_users:
-                _sendfile_users.discard(sender_id)
-                await _respond(event, _render_sendfile_state(False))
-            else:
-                _sendfile_users.add(sender_id)
-                await _respond(event, _render_sendfile_state(True))
             return
 
         # ===== MEDIA REENVIADA =====

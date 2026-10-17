@@ -1,12 +1,12 @@
 # Bot de Telegram (Telethon) - Subida a S3
 
-Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siempre devuelve la URL pública**. Por defecto solo envía la URL como texto: no transfiere el archivo por Telegram. Descargarlo desde S3 consume datos del plan de toDus (desde octubre de 2021 no es gratis), pero normalmente sale más barato que recibirlo por Telegram, que usa datos internacionales. Con `/sendfile` el bot también reenvía el archivo por Telegram.
+Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **devuelve únicamente la URL pública**, siempre como mensaje de texto. El bot **nunca reenvía el archivo por Telegram**: así no se transfieren datos de más y cada usuario decide cuándo descarga (descargarlo desde S3 consume datos del plan de toDus, que desde octubre de 2021 no es gratis).
 
 ## ✨ Características
 
 - ✅ **Cliente Telethon en modo bot oficial** (`TG_BOT_TOKEN`, o `TG_SESSION_STRING` de un bot)
 - ✅ **La URL S3 siempre se muestra al usuario**
-- ✅ **Modo solo URL por defecto**: no transfiere el archivo por Telegram; la descarga desde S3 se hace cuando el usuario quiera
+- ✅ **Solo entrega la URL**: nunca reenvía el archivo por Telegram; la descarga se hace cuando el usuario quiera
 - ✅ **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`; Telegram impone su tope físico
 - ✅ **Detección correcta de enlaces con vista previa** (no sube la miniatura)
 - ✅ **Cola por usuario**: los álbumes y envíos seguidos se procesan en orden
@@ -107,8 +107,7 @@ python scripts/generate_bot_session.py
 | `SSRF_BLOCK_PRIVATE` | `1` | Bloquea IPs privadas/loopback |
 | `PORT` | `10000` | Puerto HTTP (Render lo inyecta) |
 | `DOWNLOAD_PATH` | `/tmp/tg_uploads` | Directorio temporal |
-| `MAX_FILE_SIZE_MB` | `0` | Tamaño máximo; `0` = **sin límite** (Telegram impone el suyo) |
-| `TG_UPLOAD_LIMIT_MB` | `0` | Comprobación previa al enviar a Telegram; `0` = sin límite |
+| `MAX_FILE_SIZE_MB` | `0` | Tamaño máximo; `0` = **sin límite** (solo lo limita el disco) |
 | `CHUNK_SIZE_MB` | `8` | Tamaño de chunk de descarga |
 | `DOWNLOAD_TIMEOUT_SECONDS` | `3600` | Tiempo máximo de descarga (no es límite de tamaño) |
 | `UPLOAD_TIMEOUT_SECONDS` | `3600` | Tiempo máximo de subida a S3 (no es límite de tamaño) |
@@ -117,7 +116,6 @@ python scripts/generate_bot_session.py
 | `PARALLEL_URL_DOWNLOAD` | `1` | Descarga paralela |
 | `PARALLEL_URL_PARTS` | `4` | Partes paralelas |
 | `PARALLEL_URL_MIN_SIZE_MB` | `50` | Tamaño mínimo para intentar descarga paralela |
-| `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). `1` = reenviar siempre; los usuarios pueden activar con `/sendfile` |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `S3_ENDPOINT` | `https://s3.todus.cu` | Endpoint S3 |
 | `S3_BUCKET` | `stream` | Bucket S3 |
@@ -136,27 +134,22 @@ Ver `.env.example` para referencia.
 | `/start`, `hola`, `ayuda`, `help` | Mensaje de ayuda |
 | `/cancel`, `cancelar` | Cancela tu trabajo activo |
 | `/status` | Verifica si tienes trabajo en curso |
-| `/sendfile` | Toggle: recibir también el archivo (consume datos de Telegram) — por defecto OFF; requiere `SEND_FILE_VIA_TG=1` |
-| `/textonly` | Desactiva el envío del archivo (solo URL); idempotente |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
 
-### Comportamiento por defecto (solo URL)
+### Entrega: solo el enlace
 
-Por defecto el bot **solo envía la URL S3 como texto** y no reenvía el archivo. Conviene distinguir qué tráfico consume cada cosa:
+El bot **siempre responde con la URL S3 como texto** y nunca reenvía el archivo por Telegram. Conviene distinguir qué tráfico consume cada cosa:
 
 | Qué ocurre | ¿Consume datos? |
 |---|---|
 | El bot te envía la URL por Telegram (texto) | **Muy poco**: unos KB, no el tamaño del archivo |
 | Descargas el archivo desde `s3.todus.cu` | **Sí**, del plan de toDus: primero datos nacionales y luego internacionales. No es gratis desde octubre de 2021 |
-| Recibes el archivo por Telegram (`/sendfile`) | **Sí**, el tamaño completo, y por la red de Telegram (normalmente datos internacionales o WiFi) |
 | Compartes la URL como texto dentro de toDus | **No**: la mensajería de texto de toDus es ilimitada |
 
-En resumen: **la URL como texto es barata; lo que cuesta es mover el archivo**, ya sea por Telegram o descargándolo de S3. La ventaja de S3 es que la descarga usa datos nacionales de toDus en vez de datos internacionales, pero sigue consumiendo plan. El bot no evade la facturación de toDus.
+En resumen: **la URL como texto es barata; lo que cuesta es mover el archivo**, y esa decisión queda en manos del usuario. La descarga desde S3 usa datos nacionales de toDus en vez de datos internacionales, pero sigue consumiendo plan. El bot no evade la facturación de toDus.
 
-Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo solo URL, escribe `/textonly` (o `/sendfile` otra vez).
-
-Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`. Si el administrador deja `SEND_FILE_VIA_TG=0`, `/sendfile` responde que el envío está deshabilitado.
+Si antes usabas `/sendfile` o `/textonly`, esos comandos ya no existen: el comportamiento es siempre el mismo.
 
 ## 🎨 Interfaz minimalista
 
@@ -172,7 +165,7 @@ El bot ahora usa mensajes limpios y profesionales, sin caracteres ruidosos ni in
 ⏳ Descargando archivo.mp4 · 15.2 MB
 ```
 
-### Resultado final (modo default, solo URL)
+### Resultado final
 ```
 ✓ Subido a S3
 📎 Origen: canalVideosCubanos
@@ -182,15 +175,9 @@ MP4 · 15.2 MB · nube
 🔗 https://s3.todus.cu/stream/a1b2c3d4_archivo.mp4
 ```
 
-### Resultado final (modo `/sendfile`, recibe el archivo)
-```
-✓ Enviado como video · 15.2 MB
-```
-*(el archivo se envía como media con el caption del resultado)*
-
 ### Mensajes de error
 ```
-✗ Archivo de 3.2 GB — Telegram no admite ese tamaño en modo bot.
+✗ Disco insuficiente: 1.2 GB libres, se necesitan 3.2 GB
 ```
 
 ### Comando /help
@@ -201,19 +188,14 @@ MP4 · 15.2 MB · nube
   • Envía un enlace http(s)://... y lo subo
   • Reenvía un archivo (foto, video, audio, doc) y lo subo
 
-Por defecto solo te envío la URL como texto (no se transfiere el archivo).
-Descargarlo desde S3 consume datos de toDus; recibirlo por Telegram, datos
-de tu plan de internet.
-Si quieres recibir el archivo además de la URL, usa /sendfile.
+Siempre te devuelvo solo el enlace: no reenvío el archivo.
+Descargarlo consume datos de toDus, así que tú decides cuándo hacerlo.
 
 Comandos
   /cancel — cancela tu trabajo actual
   /status — muestra si tienes trabajo en curso
-  /sendfile — toggle: recibir archivo + URL (gasta datos)
-  /textonly — desactivar el envío del archivo (solo URL)
 
-El bot no impone límite de tamaño; Telegram sí limita cada archivo
-(2 GB por archivo en modo bot).
+El bot no impone límite de tamaño; solo el espacio en disco.
 ```
 
 ## 📊 toDus y el consumo de datos
@@ -255,13 +237,7 @@ En teoría sí: se codifica en base64 y se trocea en mensajes. En la práctica *
 - Envía la **URL por Telegram como texto**: unos KB en lugar del archivo completo.
 - **No promete ni intenta** que la descarga sea gratuita: no evade la facturación de toDus.
 - Deja la descarga a decisión del usuario. Para ahorrar de verdad, descarga por WiFi o con datos nacionales, no con el bono internacional.
-- Si además se reenvía el archivo por Telegram (`/sendfile`), se transfiere el archivo completo y consume datos de Telegram.
-
-**Para activar el modo solo URL:**
-```
-/textonly
-```
-A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para volver a recibir el archivo, escribe `/sendfile`.
+- **Nunca reenvía el archivo por Telegram**: solo manda el enlace.
 
 ### Fuentes
 
@@ -285,7 +261,7 @@ https://example.com/archivo.mp4
 ### 2. Reenviar o subir un archivo
 - Reenvía cualquier mensaje que contenga media (foto, video, audio, documento) al bot
 - O sube un archivo directamente desde tu dispositivo al chat del bot
-- El bot lo descarga, lo sube a S3 y te devuelve la URL (y el archivo si tienes `/sendfile` activo)
+- El bot lo descarga, lo sube a S3 y te devuelve la URL como texto (nunca reenvía el archivo)
 
 ### Tipos soportados
 | Tipo | Extensiones |
@@ -351,8 +327,7 @@ Ten en cuenta que:
 10. **Álbumes**: solo se procesaba la primera foto
 11. **Markdown roto** en `/help` y captions con nombres especiales
 12. **Nombres de archivo sin truncar** → `ENAMETOOLONG`
-13. **`/sendfile` decía “activado” aunque el administrador lo tuviera desactivado**
-14. **`/textonly` activaba el modo archivo** en vez de desactivarlo (era un alias del toggle)
+13. **El bot reenviaba el archivo por Telegram** (y el toggle `/sendfile` se contradecía); ahora solo entrega el enlace
 
 ## 🆘 Troubleshooting
 
@@ -386,7 +361,7 @@ Esto ya está corregido. El método correcto es `add_event_handler(callback, eve
 
 **Comprobaciones:**
 1. Abre el chat del bot e inícialo con `/start`; los bots no pueden escribir primero.
-2. El mensaje debe contener una URL, ser un archivo/foto/video o un comando (`/start`, `/status`, `/cancel`, `/sendfile`).
+2. El mensaje debe contener una URL, ser un archivo/foto/video o un comando (`/start`, `/status`, `/cancel`).
 3. Si defines `ALLOWED_TG_IDS`, tu ID tiene que estar en la lista o el bot responderá “No estás autorizado”.
 4. Revisa los logs: si aparece “La sesión configurada es de una cuenta personal”, sustituye `TG_SESSION_STRING` por uno generado con `scripts/generate_bot_session.py` o borra esa variable y usa `TG_BOT_TOKEN`.
 5. Si usas Render free, el servicio se suspende sin tráfico; el primer mensaje puede tardar ~1 minuto en arrancar.

@@ -141,12 +141,14 @@ class TestMediaYUI(unittest.TestCase):
         self.assertFalse(bot._session_is_bot(SimpleNamespace(bot=False)))
         self.assertFalse(bot._session_is_bot(SimpleNamespace()))
 
-    def test_help_aclara_el_consumo_de_datos(self):
-        text = bot._render_help(sendfile_enabled=True)
-        self.assertIn("Descargarlo desde S3 consume datos de toDus", text)
-        self.assertIn("2 GB por archivo en modo bot", text)
-        self.assertNotIn("4 GB", text)
+    def test_help_solo_enlace_y_consumo(self):
+        text = bot._render_help()
+        self.assertIn("no reenvío el archivo", text)
+        self.assertIn("Descargarlo consume datos de toDus", text)
+        self.assertNotIn("/sendfile", text)
         self.assertNotIn("ahorra datos", text)
+        self.assertFalse(hasattr(bot, "SEND_FILE_VIA_TG"))
+        self.assertFalse(hasattr(bot, "_send_file_via_telegram"))
 
     def test_result_card_y_comandos(self):
         card = bot._render_result_card(
@@ -414,34 +416,44 @@ class _FakeEvent:
         return None
 
 
-class TestSendfileYTextonly(unittest.IsolatedAsyncioTestCase):
-    async def test_textonly_desactiva_el_envio(self):
-        with patch.object(bot, "SEND_FILE_VIA_TG", True):
-            bot._sendfile_users.add(12345)
-            event = _FakeEvent("/textonly")
-            await bot.on_tg_message(event)
-
-        self.assertNotIn(12345, bot._sendfile_users)
-        self.assertIn("desactivado", event.replies[-1])
-
+class TestSoloEnlace(unittest.IsolatedAsyncioTestCase):
     async def test_allowlist_bloquea_a_otros(self):
         with patch.object(bot, "ALLOWED_TG_IDS", {999}):
             event = _FakeEvent("/status")
             await bot.on_tg_message(event)
         self.assertIn("No estás autorizado", event.replies[-1])
 
-    async def test_sendfile_alterna(self):
-        bot._sendfile_users.discard(12345)
-        with patch.object(bot, "SEND_FILE_VIA_TG", True):
-            event = _FakeEvent("/sendfile")
-            await bot.on_tg_message(event)
-            self.assertIn(12345, bot._sendfile_users)
-            self.assertIn("activado", event.replies[-1])
+    async def test_sendfile_y_textonly_ya_no_existen(self):
+        with patch.object(bot, "ALLOWED_TG_IDS", None):
+            for texto in ("/sendfile", "/textonly"):
+                event = _FakeEvent(texto)
+                await bot.on_tg_message(event)
+                self.assertIn("Envía un enlace", event.replies[-1])
 
-            event = _FakeEvent("/sendfile")
-            await bot.on_tg_message(event)
-            self.assertNotIn(12345, bot._sendfile_users)
-            self.assertIn("desactivado", event.replies[-1])
+    async def test_deliver_solo_envia_la_url(self):
+        temp_path = os.path.join(_TEST_DOWNLOAD, "entrega.bin")
+        with open(temp_path, "wb") as f:
+            f.write(b"x" * 16)
+        job = bot.QueuedJob(
+            user_id=5, kind="url", url="https://example.com/x",
+            chat_id=5, status_msg=object(),
+        )
+        edit = unittest.mock.AsyncMock(return_value=None)
+        client = SimpleNamespace(send_file=unittest.mock.AsyncMock())
+
+        async def fake_upload(path, filename, size):
+            return "https://s3.example/stream/x.bin"
+
+        with patch.object(bot, "tg_edit_status", new=edit), \
+             patch.object(bot, "subir_a_s3", new=fake_upload), \
+             patch.object(bot, "_tg_client", client):
+            await bot._deliver(job, temp_path, "x.bin", "web")
+
+        client.send_file.assert_not_awaited()
+        card = edit.await_args_list[-1].args[2]
+        self.assertIn("https://s3.example/stream/x.bin", card)
+        self.assertIn("Subido a S3", card)
+        os.unlink(temp_path)
 
 
 class _FakeTelegramClient:

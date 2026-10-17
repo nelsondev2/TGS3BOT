@@ -53,8 +53,6 @@ services:
       # === Comportamiento ===
       - key: MAX_FILE_SIZE_MB
         value: "0"  # 0 = sin límite del bot (Telegram impone el suyo)
-      - key: TG_UPLOAD_LIMIT_MB
-        value: "0"  # 0 = sin comprobación previa
       - key: DOWNLOAD_TIMEOUT_SECONDS
         value: "3600"
       - key: UPLOAD_TIMEOUT_SECONDS
@@ -67,8 +65,6 @@ services:
         value: "14100"
       - key: LOG_LEVEL
         value: "INFO"
-      - key: SEND_FILE_VIA_TG
-        value: "0"  # "1" = reenviar archivo + URL (gasta datos)
     # Disco persistente: solo en planes de pago.
     # Ajusta sizeGB al tamaño máximo que quieras manejar (deja margen).
     # disk:
