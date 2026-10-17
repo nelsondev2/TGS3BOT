@@ -384,3 +384,42 @@ class TestPinnedResolver(unittest.IsolatedAsyncioTestCase):
         records = await resolver.resolve("localhost", 80)
         self.assertTrue(records)
         self.assertIn(records[0]["host"], ("127.0.0.1", "::1"))
+
+
+class _FakeEvent:
+    def __init__(self, text):
+        self.chat_id = 12345
+        self.raw_text = text
+        self.message = SimpleNamespace(raw_text=text, media=None, out=False, id=1)
+        self.replies = []
+
+    async def get_sender(self):
+        return SimpleNamespace(id=12345, username="tester", first_name="Test")
+
+    async def respond(self, text):
+        self.replies.append(text)
+        return None
+
+
+class TestSendfileYTextonly(unittest.IsolatedAsyncioTestCase):
+    async def test_textonly_desactiva_el_envio(self):
+        with patch.object(bot, "SEND_FILE_VIA_TG", True):
+            bot._sendfile_users.add(12345)
+            event = _FakeEvent("/textonly")
+            await bot.on_tg_message(event)
+
+        self.assertNotIn(12345, bot._sendfile_users)
+        self.assertIn("desactivado", event.replies[-1])
+
+    async def test_sendfile_alterna(self):
+        bot._sendfile_users.discard(12345)
+        with patch.object(bot, "SEND_FILE_VIA_TG", True):
+            event = _FakeEvent("/sendfile")
+            await bot.on_tg_message(event)
+            self.assertIn(12345, bot._sendfile_users)
+            self.assertIn("activado", event.replies[-1])
+
+            event = _FakeEvent("/sendfile")
+            await bot.on_tg_message(event)
+            self.assertNotIn(12345, bot._sendfile_users)
+            self.assertIn("desactivado", event.replies[-1])

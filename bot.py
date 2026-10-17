@@ -771,6 +771,7 @@ def _render_help(is_userbot=False, sendfile_enabled=True):
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
+        "  /textonly — desactivar el envío del archivo (solo URL)",
         "",
         "El bot no impone límite de tamaño; Telegram sí limita cada archivo",
         "(2 GB en bots, 4 GB en cuentas premium).",
@@ -1500,7 +1501,8 @@ async def on_tg_message(event):
                     event, _render_sendfile_state(False, available=False)
                 )
                 return
-            if sender_id in _sendfile_users:
+            # /textonly siempre desactiva (idempotente); /sendfile alterna.
+            if command == "/textonly" or sender_id in _sendfile_users:
                 _sendfile_users.discard(sender_id)
                 await _respond(event, _render_sendfile_state(False))
             else:

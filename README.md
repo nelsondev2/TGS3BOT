@@ -142,7 +142,7 @@ Ver `.env.example` para referencia.
 | `/cancel`, `cancelar` | Cancela tu trabajo activo |
 | `/status` | Verifica si tienes trabajo en curso |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF; requiere `SEND_FILE_VIA_TG=1` |
-| `/textonly` | Alias de `/sendfile` (compatibilidad) |
+| `/textonly` | Desactiva el envío del archivo (solo URL); idempotente |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
 
@@ -242,7 +242,7 @@ El bot envía la **URL pública S3 como mensaje de texto**, que es ilimitado en 
 ```
 /textonly
 ```
-A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para desactivar, escribe `/textonly` otra vez.
+A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para volver a recibir el archivo, escribe `/sendfile`.
 
 ## 📎 Aceptar archivos reenviados
 
