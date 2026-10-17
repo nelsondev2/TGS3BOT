@@ -1,11 +1,12 @@
 # Bot de Telegram (Telethon) - Subida a S3
 
-Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siempre devuelve la URL pública**. Por defecto solo envía la URL como texto (ahorra datos en toDus); con `/sendfile` también reenvía el archivo.
+Bot de Telegram que recibe enlaces o archivos reenviados, los sube a S3 y **siempre devuelve la URL pública**. Por defecto solo envía la URL como texto: no transfiere el archivo por Telegram. Descargarlo desde S3 consume datos del plan de toDus (desde octubre de 2021 no es gratis), pero normalmente sale más barato que recibirlo por Telegram, que usa datos internacionales. Con `/sendfile` el bot también reenvía el archivo por Telegram.
 
 ## ✨ Características
 
 - ✅ **Cliente Telethon en modo bot oficial** (`TG_BOT_TOKEN`, o `TG_SESSION_STRING` de un bot)
 - ✅ **La URL S3 siempre se muestra al usuario**
+- ✅ **Modo solo URL por defecto**: no transfiere el archivo por Telegram; la descarga desde S3 se hace cuando el usuario quiera
 - ✅ **Sin límite de tamaño por defecto**: `MAX_FILE_SIZE_MB=0`; Telegram impone su tope físico
 - ✅ **Detección correcta de enlaces con vista previa** (no sube la miniatura)
 - ✅ **Cola por usuario**: los álbumes y envíos seguidos se procesan en orden
@@ -135,18 +136,25 @@ Ver `.env.example` para referencia.
 | `/start`, `hola`, `ayuda`, `help` | Mensaje de ayuda |
 | `/cancel`, `cancelar` | Cancela tu trabajo activo |
 | `/status` | Verifica si tienes trabajo en curso |
-| `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF; requiere `SEND_FILE_VIA_TG=1` |
+| `/sendfile` | Toggle: recibir también el archivo (consume datos de Telegram) — por defecto OFF; requiere `SEND_FILE_VIA_TG=1` |
 | `/textonly` | Desactiva el envío del archivo (solo URL); idempotente |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
 
-### Comportamiento por defecto (ahorra datos)
+### Comportamiento por defecto (solo URL)
 
-Por defecto el bot **SOLO envía la URL S3 como texto**, no reenvía el archivo. Esto es porque en toDus:
-- ✅ Mensajes de texto = ilimitados (no consumen plan)
-- ❌ Multimedia (fotos, videos, archivos) = consumen los 600 MB / 1 GB del plan
+Por defecto el bot **solo envía la URL S3 como texto** y no reenvía el archivo. Conviene distinguir qué tráfico consume cada cosa:
 
-Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo ahorro, escribe `/sendfile` otra vez.
+| Qué ocurre | ¿Consume datos? |
+|---|---|
+| El bot te envía la URL por Telegram (texto) | **Muy poco**: unos KB, no el tamaño del archivo |
+| Descargas el archivo desde `s3.todus.cu` | **Sí**, del plan de toDus: primero datos nacionales y luego internacionales. No es gratis desde octubre de 2021 |
+| Recibes el archivo por Telegram (`/sendfile`) | **Sí**, el tamaño completo, y por la red de Telegram (normalmente datos internacionales o WiFi) |
+| Compartes la URL como texto dentro de toDus | **No**: la mensajería de texto de toDus es ilimitada |
+
+En resumen: **la URL como texto es barata; lo que cuesta es mover el archivo**, ya sea por Telegram o descargándolo de S3. La ventaja de S3 es que la descarga usa datos nacionales de toDus en vez de datos internacionales, pero sigue consumiendo plan. El bot no evade la facturación de toDus.
+
+Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo solo URL, escribe `/textonly` (o `/sendfile` otra vez).
 
 Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`. Si el administrador deja `SEND_FILE_VIA_TG=0`, `/sendfile` responde que el envío está deshabilitado.
 
@@ -193,50 +201,77 @@ MP4 · 15.2 MB · nube
   • Envía un enlace http(s)://... y lo subo
   • Reenvía un archivo (foto, video, audio, doc) y lo subo
 
-Por defecto solo te envío la URL como texto (ahorra datos en toDus).
+Por defecto solo te envío la URL como texto (no se transfiere el archivo).
+Descargarlo desde S3 consume datos de toDus; recibirlo por Telegram, datos
+de tu plan de internet.
 Si quieres recibir el archivo además de la URL, usa /sendfile.
 
 Comandos
   /cancel — cancela tu trabajo actual
   /status — muestra si tienes trabajo en curso
   /sendfile — toggle: recibir archivo + URL (gasta datos)
+  /textonly — desactivar el envío del archivo (solo URL)
+
+El bot no impone límite de tamaño; Telegram sí limita cada archivo
+(2 GB por archivo en modo bot).
 ```
 
-## 📊 ¿toDus consume megas por mensajes de texto?
-
-**No.** Según investigación realizada (fuentes: cubadebate.cu, etecsa.cu, todus.cu, fonoma.com):
+## 📊 toDus y el consumo de datos
 
 ### Plan toDus (25 CUP, 35 días)
-- ✅ **Mensajería por texto ILIMITADA** — los mensajes de texto no consumen datos del plan
-- 📦 **600 MB / 1 GB de datos nacionales** — se usan para multimedia (fotos, videos, archivos)
 
-### ¿Qué consume el plan de datos?
-- ❌ Enviar/recibir imágenes
-- ❌ Enviar/recibir videos
-- ❌ Enviar/recibir archivos
-- ❌ Enviar/recibir notas de voz
-- ✅ **NO consume**: mensajes de texto puros
+- ✅ **Mensajería por texto ilimitada**: no descuenta del plan, ni siquiera cuando se agotan los datos.
+- 📦 **1 GB de datos** (desde abril de 2026; antes 600 MB) para el resto de servicios de la app y el correo Nauta.
 
-### ¿Se puede enmascarar multimedia como texto?
+### Qué consume el plan
 
-**Técnicamente sí, pero es impráctico:**
-1. **Base64**: un archivo de 10 MB se convierte en ~13.3 MB en base64 (33% más grande)
-2. **Límite de mensaje**: toDus/Telegram tienen límites por mensaje (4096 chars)
-3. Un archivo de 10 MB necesitaría ~2500 mensajes de texto
-4. El receptor tendría que decodificar y concatenar manualmente
+- ❌ Enviar/recibir imágenes, videos, archivos y notas de voz.
+- ❌ El correo Nauta y otros servicios dentro de toDus.
+- ✅ **No consume**: los mensajes de texto puros.
 
-**Solución mejor que ya está implementada en el bot:**
+ETECSA descuenta primero los datos nacionales y, si se agotan, los internacionales.
 
-El bot envía la **URL pública S3 como mensaje de texto**, que es ilimitado en toDus. El receptor puede:
-- Ver la URL sin gastar datos
-- Descargar el archivo solo cuando tenga WiFi o quiera gastar datos
-- Compartir la URL por otras vías (SMS, etc.)
+### ¿Las descargas de `s3.todus.cu` son gratis?
 
-**Para activar este modo en el bot:**
+**No, desde el 21 de octubre de 2021.** Hasta esa fecha el tráfico de archivos de toDus era gratuito y la llamada «Comunidad S3» compartía películas, series y juegos de varios GB mediante enlaces y archivos `txt`. Con la versión 1.0 de toDus, ETECSA empezó a tasar las transferencias de archivos y creó la bolsa de mensajería de 600 MB. Los «trucos» que siguen circulando son de esa época y ya no funcionan:
+
+- **Descargas S3**: el tráfico se descuenta del plan, igual que cualquier archivo.
+- **«Piscina de fichas»** (repartir cuentas entre usuarios): no elimina el consumo, solo reparte el gasto entre varias fichas. toDus limita los MB multimedia por ventana de tiempo y deniega descargas al superarlo. Además, usar cuentas de terceros va contra los términos del servicio.
+- **Descargas directas** (compartir un archivo desde el propio móvil por HTTP): fue el reemplazo que intentó la comunidad en 2021, pero exige que el emisor tenga el archivo y esté conectado; no sirve para un bot alojado en la nube.
+- **APKs modificadas o clientes no oficiales**: toDus los bloquea y puede suspender la cuenta.
+
+### ¿Se puede mandar un archivo como si fuera texto?
+
+En teoría sí: se codifica en base64 y se trocea en mensajes. En la práctica **no es viable**:
+
+1. Base64 añade un 33 %: 10 MB se convierten en ~13,3 MB.
+2. toDus 2.1.0 limita cada mensaje a **1.024 caracteres** (abril de 2026). Un archivo de 10 MB necesitaría **unos 13.650 mensajes**.
+3. Hay que numerar, verificar y reenviar cada trozo: cualquier pérdida corrompe el archivo.
+4. El receptor necesitaría una app que reconstruya el archivo; la app oficial solo mostraría miles de burbujas de texto.
+5. Un bot que envía miles de mensajes seguidos entra en FloodWait y pone en riesgo la cuenta. Disfrazar multimedia como texto también incumple los términos de toDus.
+
+### Qué hace este bot
+
+- Envía la **URL por Telegram como texto**: unos KB en lugar del archivo completo.
+- **No promete ni intenta** que la descarga sea gratuita: no evade la facturación de toDus.
+- Deja la descarga a decisión del usuario. Para ahorrar de verdad, descarga por WiFi o con datos nacionales, no con el bono internacional.
+- Si además se reenvía el archivo por Telegram (`/sendfile`), se transfiere el archivo completo y consume datos de Telegram.
+
+**Para activar el modo solo URL:**
 ```
 /textonly
 ```
 A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para volver a recibir el archivo, escribe `/sendfile`.
+
+### Fuentes
+
+- ETECSA actualiza el Plan toDus (Cubadebate, 1 de abril de 2026): <http://www.cubadebate.cu/noticias/2026/04/01/etecsa-actualiza-el-plan-todus/>
+- Lanzan nuevo plan de datos para toDus, 1 GB y límite de 1.024 caracteres (CubitaNOW, 2 de abril de 2026): <https://noticias.cubitanow.com/lanzan-nuevo-plan-de-datos-para-la-app-nacional-todus-en-medio-de-control-digital-en-cuba>
+- toDus lanza su versión 1.0 y empieza a tasar los archivos (Cubadebate, 21 de octubre de 2021): <http://www.cubadebate.cu/noticias/2021/10/21/la-aplicacion-cubana-para-mensajeria-instantanea-todus-lanza-su-version-1-0/>
+- ETECSA limita las descargas S3 (Cubanet, 21 de octubre de 2021): <https://www.cubanet.org/etecsa-limita-descargas-s3-con-nueva-promocion-de-intranet/>
+- Series y películas por toDus: del S3 gratuito a la limitación por ventanas de tiempo (elTOQUE, agosto de 2021): <https://eltoque.com/series-y-peliculas-por-todus-adios-paquete-semanal>
+
+Las tarifas y límites de toDus cambian con frecuencia: si ETECSA los modifica, actualiza esta sección.
 
 ## 📎 Aceptar archivos reenviados
 
@@ -289,6 +324,12 @@ El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 5
 
 ### Sobre el S3
 El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cambiarlo a cualquier S3 compatible (AWS, MinIO, Cloudflare R2, etc.) seteando `S3_ENDPOINT`, `S3_BUCKET`, `S3_UNSIGNED=0`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`.
+
+Ten en cuenta que:
+
+- El bucket es **público y sin firma**: cualquiera con la URL puede abrir el archivo. No subas contenido sensible.
+- **La descarga no es tráfico gratis**: se descuenta del plan de toDus del usuario (nacional o internacional), como cualquier archivo.
+- Los objetos no caducan solos; si te importa el almacenamiento, define una política de retención en el bucket.
 
 ### Sobre el disco
 - `/tmp/tg_uploads` es efímero en Render free (se pierde en cada deploy).

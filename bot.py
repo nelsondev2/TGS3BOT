@@ -143,7 +143,8 @@ PARALLEL_URL_MIN_SIZE = _env_int("PARALLEL_URL_MIN_SIZE_MB", 50, minimum=0) * 10
 SSRF_BLOCK_PRIVATE = _env_bool("SSRF_BLOCK_PRIVATE", True)
 
 # --- Comportamiento ---
-# Por defecto solo se envía la URL S3 como texto (ahorra datos en toDus).
+# Por defecto solo se envía la URL S3 como texto: no se transfiere el archivo
+# por Telegram; la descarga desde S3 se descuenta del plan de toDus.
 SEND_FILE_VIA_TG = _env_bool("SEND_FILE_VIA_TG", False)
 
 # --- HTTP Headers ---
@@ -742,7 +743,9 @@ def _render_help(sendfile_enabled=True):
         "  • Envía un enlace http(s)://... y lo subo",
         "  • Reenvía un archivo (foto, video, audio, doc) y lo subo",
         "",
-        "Por defecto solo te envío la URL como texto (ahorra datos en toDus).",
+        "Por defecto solo te envío la URL como texto (no se transfiere el archivo).",
+        "Descargarlo desde S3 consume datos de toDus; recibirlo por Telegram, datos",
+        "de tu plan de internet.",
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
         "Comandos",
@@ -752,7 +755,7 @@ def _render_help(sendfile_enabled=True):
         "  /textonly — desactivar el envío del archivo (solo URL)",
         "",
         "El bot no impone límite de tamaño; Telegram sí limita cada archivo",
-        "(2 GB en bots, 4 GB en cuentas premium).",
+        "(2 GB por archivo en modo bot).",
     ]
     if not sendfile_enabled:
         lines.append("")
@@ -769,11 +772,12 @@ def _render_sendfile_state(enabled, available=True):
     if enabled:
         return (
             f"{ICON_DONE} Modo archivo activado\n\n"
-            "A partir de ahora recibirás el archivo además de la URL."
+            "A partir de ahora recibirás el archivo además de la URL "
+            "(consume datos de Telegram)."
         )
     return (
         f"{ICON_DONE} Modo archivo desactivado\n\n"
-        "Solo recibirás la URL S3 (ahorra datos en toDus)."
+        "Solo recibirás la URL S3 (no se transfiere el archivo)."
     )
 
 

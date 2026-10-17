@@ -141,6 +141,13 @@ class TestMediaYUI(unittest.TestCase):
         self.assertFalse(bot._session_is_bot(SimpleNamespace(bot=False)))
         self.assertFalse(bot._session_is_bot(SimpleNamespace()))
 
+    def test_help_aclara_el_consumo_de_datos(self):
+        text = bot._render_help(sendfile_enabled=True)
+        self.assertIn("Descargarlo desde S3 consume datos de toDus", text)
+        self.assertIn("2 GB por archivo en modo bot", text)
+        self.assertNotIn("4 GB", text)
+        self.assertNotIn("ahorra datos", text)
+
     def test_result_card_y_comandos(self):
         card = bot._render_result_card(
             "archivo", "mp4", 1024, "https://s3.example/stream/x.mp4"
