@@ -9,6 +9,8 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 - ✅ **Protección SSRF**: bloquea IPs privadas/loopback/link-local
 - ✅ **Allowlist de usuarios** opcional vía `ALLOWED_TG_IDS`
 - ✅ **Event loop no bloqueado**: llamadas síncronas envueltas en `asyncio.to_thread`
+- ✅ **Subida a toDus como la app real**: PUT directo en una sola petición (sin multipart de boto3) y keys `users/tg_<id>/telegram/...` — las keys sueltas en la raíz del bucket público son las primeras que purgan los barridos de limpieza, por eso los enlaces vencían casi al instante
+- ✅ **Verificación post-subida**: el enlace se entrega solo tras comprobar con HEAD que el objeto existe y tiene el tamaño correcto; si no quedó activo, se re-sube automáticamente (nunca se entrega un enlace muerto como ✓)
 - ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
 - ✅ **Limpieza de archivos `.part`** en cancelación o fallo
@@ -138,7 +140,12 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `S3_ENDPOINT` | `https://s3.todus.cu` | Endpoint S3 |
 | `S3_BUCKET` | `stream` | Bucket S3 |
-| `S3_UNSIGNED` | `1` | S3 sin firma (toDus) |
+| `S3_UNSIGNED` | `1` | S3 sin firma (toDus): subida con PUT directo. `0` = boto3 firmado contra tu propio S3 |
+| `S3_KEY_PREFIX` | `users` | Namespace de las keys: `users/tg_<id>/telegram/<fecha>-<rand>/telegram_<id>_<nombre>`. `none` = keys planas en la raíz (NO recomendado en toDus: son las primeras en purgarse) |
+| `S3_UPLOAD_RETRIES` | `3` | Reintentos de subida + verificación ante fallos transitorios |
+| `S3_UPLOAD_TIMEOUT` | `1800` | Tiempo total máximo (s) para subir y verificar un archivo |
+| `S3_VERIFY_UPLOAD` | `1` | Comprobar con HEAD que el objeto existe antes de entregar el enlace |
+| `S3_VERIFY_ATTEMPTS` | `6` | Intentos de la verificación HEAD (con backoff) |
 | `S3_ACCESS_KEY` | `public` | Key (si S3_UNSIGNED=0) |
 | `S3_SECRET_KEY` | `public` | Secret (si S3_UNSIGNED=0) |
 
@@ -187,7 +194,7 @@ El bot ahora usa mensajes limpios y profesionales, sin caracteres ruidosos ni in
 📄 archivo.mp4
 MP4 · 15.2 MB · nube
 
-🔗 https://s3.todus.cu/stream/a1b2c3d4_archivo.mp4
+🔗 https://s3.todus.cu/stream/users/tg_123456789/telegram/20261026-101500-a1b2c3/telegram_d4e5f6a7b8c9_archivo.mp4
 ```
 
 ### Resultado final (modo `/sendfile`, recibe el archivo)
@@ -211,6 +218,8 @@ MP4 · 15.2 MB · nube
 
 Por defecto solo te envío la URL como texto (ahorra datos en toDus).
 Si quieres recibir el archivo además de la URL, usa /sendfile.
+
+Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.
 
 Comandos
   /cancel — cancela tu trabajo actual
@@ -302,6 +311,8 @@ El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 5
 ### Sobre el S3
 El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cambiarlo a cualquier S3 compatible (AWS, MinIO, Cloudflare R2, etc.) seteando `S3_ENDPOINT`, `S3_BUCKET`, `S3_UNSIGNED=0`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`.
 
+**Ojo con la permanencia en toDus:** el bucket `stream` es anónimo también para listar y borrar, y toDus puede purgar objetos sin aviso. El bot imita a la app real (PUT directo + keys `users/tg_<id>/telegram/...` + verificación) para que los archivos se traten como media normal y duren lo máximo posible, pero ningún cliente puede hacer permanentes los enlaces en un bucket público ajeno: descarga pronto, y si necesitas permanencia real usa tu propio S3 con `S3_UNSIGNED=0`.
+
 ### Sobre el disco
 - `/tmp/tg_uploads` es efímero en Render (se pierde en cada deploy).
 - Los archivos temporales se eliminan después de subirlos a S3 y enviarlos por Telegram.
@@ -321,8 +332,22 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 10. SIGTERM sin handler registrado
 11. Sin timeout en upload S3
 12. Sesión Telethon no persistente → `FloodWaitError` tras múltiples deploys
+13. Subida con multipart de boto3 contra toDus (su backend no es AWS): los objetos >8 MB quedaban sin ensamblar/purgables y los enlaces vencían casi al instante → PUT directo en una sola petición, como `todus-client`
+14. Keys sueltas en la raíz del bucket público (las primeras en cualquier `ListObjects` y en purgarse) → keys conformes `users/tg_<id>/telegram/...`
+15. La URL S3 se entregaba sin comprobar que el objeto existiera → verificación HEAD + tamaño con re-subida automática
 
 ## 🆘 Troubleshooting
+
+### Los enlaces dan 404 / "vencen" casi al instante de subirlos
+
+**Causa (corregida):** la versión anterior subía con el multipart de boto3 (archivos >8 MB) contra el backend de toDus, que no es AWS, y con las keys sueltas en la raíz del bucket público. Los clientes que funcionan de forma estable contra `s3.todus.cu` suben con un PUT directo y keys bajo `users/...`, como la propia app. Además, el enlace se entregaba sin verificar que el objeto existiera, así que el 404 solo se veía al tocarlo.
+
+**Ahora el bot:**
+1. Sube con un solo PUT en streaming (Content-Type real + Content-Disposition con el nombre original).
+2. Usa keys `users/tg_<tu_id>/telegram/<fecha>-<rand>/telegram_<id>_<nombre>` (configurable con `S3_KEY_PREFIX`).
+3. Verifica con HEAD que el objeto existe y tiene el tamaño correcto antes de responder; si no quedó, lo re-sube hasta `S3_UPLOAD_RETRIES` veces y, si aun así no queda activo, te muestra un error en vez de un enlace muerto.
+
+**Si aun así un enlace cae con el tiempo:** el bucket de toDus es público y anónimo hasta para borrar — toDus o terceros pueden purgarlo sin aviso y eso no lo puede evitar ningún cliente. Descarga los archivos pronto o usa tu propio S3 (`S3_UNSIGNED=0` + tus claves) para enlaces permanentes.
 
 ### `FloodWaitError: A wait of N seconds is required`
 

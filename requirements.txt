@@ -5,7 +5,8 @@
 telethon>=1.36.0
 
 # S3 y descargas
-aioboto3>=13.0.0
+# La subida a toDus (S3_UNSIGNED=1, default) es un PUT directo con aiohttp.
+# boto3 solo se usa en modo firmado (S3_UNSIGNED=0) contra un S3 propio.
 boto3>=1.35.0
 aiohttp>=3.10.0
 aiofiles>=23.2.1

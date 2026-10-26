@@ -44,6 +44,16 @@ services:
         value: "stream"
       - key: S3_UNSIGNED
         value: "1"
+      - key: S3_KEY_PREFIX
+        # "users" = keys users/tg_<id>/telegram/... como la app de toDus.
+        # NO uses keys en la raíz del bucket: son las primeras que se purgan
+        # y los enlaces vencen casi al instante.
+        value: "users"
+      - key: S3_VERIFY_UPLOAD
+        # "1" = comprobar con HEAD que el objeto existe antes de entregar el enlace
+        value: "1"
+      - key: S3_UPLOAD_RETRIES
+        value: "3"
       # === Comportamiento ===
       - key: MAX_FILE_SIZE_MB
         value: "2000"

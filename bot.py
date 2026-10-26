@@ -14,6 +14,12 @@ Mejoras aplicadas:
 - Allowlist de usuarios (ALLOWED_TG_IDS)
 - URL S3 SIEMPRE visible al usuario
 - Llamadas síncronas envueltas con asyncio.to_thread
+- Subida a toDus con PUT directo (sin multipart de boto3) y keys
+  users/tg_<id>/telegram/... como la app real: las keys en la raíz
+  del bucket público eran las primeras en purgarse y los enlaces
+  vencían casi al instante
+- Verificación post-subida (HEAD + tamaño) antes de entregar el
+  enlace, con re-subida automática si el objeto no quedó activo
 - Descarga paralela robusta: rechaza respuestas 200 OK en peticiones Range
 - Limpieza de archivos .part en cancelación/fallo
 - Detección de Content-Type cuando la URL no tiene extensión clara
@@ -30,6 +36,7 @@ import uuid
 import signal
 import asyncio
 import logging
+import mimetypes
 import threading
 import socket
 import ipaddress
@@ -37,7 +44,6 @@ from urllib.parse import urlparse, unquote, quote
 
 import aiofiles
 import aiohttp
-import aioboto3
 from aiohttp import web
 from botocore import UNSIGNED
 from botocore.config import Config as BotoConfig
@@ -79,6 +85,23 @@ S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "public")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "public")
 S3_UNSIGNED = os.environ.get("S3_UNSIGNED", "1") == "1"
+# Namespace de las keys dentro del bucket. Con toDus los archivos DEBEN ir
+# bajo "users/tg_<id>/telegram/..." (la estructura que usa la propia app):
+# las keys sueltas en la raíz del bucket público son las primeras que
+# purgan los barridos de limpieza y los enlaces "vencen" casi al instante.
+# Pon S3_KEY_PREFIX=none solo si usas tu propio bucket privado y quieres
+# las keys planas de la versión anterior (NO recomendado en toDus).
+_key_prefix_env = os.environ.get("S3_KEY_PREFIX", "users").strip().strip("/")
+S3_KEY_PREFIX = "" if _key_prefix_env.lower() in ("none", "-") else (_key_prefix_env or "users")
+# Reintentos de subida (PUT + verificación) ante fallos transitorios.
+S3_UPLOAD_RETRIES = max(1, int(os.environ.get("S3_UPLOAD_RETRIES", "3") or "3"))
+# Tiempo total máximo (segundos) para subir y verificar un archivo.
+S3_UPLOAD_TIMEOUT = int(os.environ.get("S3_UPLOAD_TIMEOUT", "1800") or "1800")
+# Verificar con HEAD que el objeto existe (y su tamaño) ANTES de entregar
+# el enlace al usuario. Sin esto, una subida fantasma se entrega como ✓
+# y el usuario descubre el 404 al tocar el enlace.
+S3_VERIFY_UPLOAD = os.environ.get("S3_VERIFY_UPLOAD", "1") == "1"
+S3_VERIFY_ATTEMPTS = max(1, int(os.environ.get("S3_VERIFY_ATTEMPTS", "6") or "6"))
 
 # --- Servidor ---
 PORT = int(os.environ.get("PORT", "10000"))
@@ -136,6 +159,11 @@ logging.getLogger("telethon").setLevel(os.environ.get("TELETHON_LOG_LEVEL", "WAR
 log = logging.getLogger("bot")
 
 # --- S3 Config ---
+# Solo se usa boto3 en modo firmado (S3_UNSIGNED=0, un S3 de verdad tipo
+# AWS/MinIO/R2). En modo unsigned (toDus, el default) la subida es un PUT
+# HTTP directo con aiohttp — ver _s3_put_direct. El multipart de boto3
+# contra el backend de toDus dejaba objetos sin ensamblar/purgables y los
+# enlaces nacían muertos o vencían casi al instante.
 _S3_CONFIG = BotoConfig(
     signature_version=UNSIGNED if S3_UNSIGNED else "s3v4",
     retries={"max_attempts": 3, "mode": "adaptive"},
@@ -150,7 +178,7 @@ _TRANSFER_CONFIG = TransferConfig(
     max_concurrency=16,
     use_threads=False,  # más seguro en contexto async
 )
-_s3_session = aioboto3.Session()
+_S3_USER_AGENT = "TGS3BOT/1.0 (+https://s3.todus.cu)"
 
 _loop = None
 _shutdown_event = asyncio.Event()
@@ -433,6 +461,8 @@ def _render_help(is_userbot=False):
         "Por defecto solo te envío la **URL** como texto (ahorra datos en toDus).",
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
+        "Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.",
+        "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
@@ -511,38 +541,372 @@ async def tg_edit_status(chat_id, msg, text):
 
 
 # ============== S3 UPLOAD ==============
-async def subir_a_s3(temp_path, filename, size):
-    safe_name = sanitize_filename(filename)
-    remote_key = f"{uuid.uuid4().hex[:8]}_{safe_name}"
-    async with _s3_session.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-        region_name=S3_REGION,
-        config=_S3_CONFIG,
-    ) as s3:
-        def _do_upload():
-            import boto3
-            client = boto3.client(
-                "s3",
-                endpoint_url=S3_ENDPOINT,
-                aws_access_key_id=S3_ACCESS_KEY,
-                aws_secret_access_key=S3_SECRET_KEY,
-                region_name=S3_REGION,
-                config=_S3_CONFIG,
-            )
-            with open(temp_path, "rb") as f:
-                client.upload_fileobj(
-                    f, S3_BUCKET, remote_key,
-                    ExtraArgs={"ContentType": "application/octet-stream"},
-                    Config=_TRANSFER_CONFIG,
-                )
-        await asyncio.wait_for(
-            asyncio.to_thread(_do_upload),
-            timeout=1800,
+# Por qué NO boto3/multipart contra toDus (causa de "los enlaces vencen
+# casi al instante"):
+#   1. La versión anterior subía con boto3 upload_fileobj, que para
+#      archivos >8 MB usa multipart de S3 (CreateMultipartUpload /
+#      UploadPart / CompleteMultipartUpload). El backend de toDus no es
+#      AWS: los clientes que funcionan de forma estable contra
+#      s3.todus.cu (todus-client y los demás bots públicos) suben con un
+#      PUT HTTP directo, en una sola petición, sin firmar. Con multipart
+#      el objeto puede quedar sin ensamblar o como upload incompleto, y
+#      el enlace nace muerto o cae en la primera purga.
+#   2. Las keys iban sueltas en la RAÍZ del bucket ("a1b2c3d4_x.mp4").
+#      El bucket es público y anónimo también para LISTAR y BORRAR: las
+#      keys de la raíz salen las primeras en cualquier ListObjects y son
+#      las primeras que purgan los barridos de limpieza. La estructura
+#      que usa la propia app de toDus es "users/<usuario>/...", y es la
+#      que hay que imitar para que los archivos se traten como media
+#      normal de la plataforma.
+#   3. La URL se entregaba al usuario sin comprobar que el objeto
+#      existiera. Ahora se verifica con HEAD (y el tamaño) antes de
+#      responder, y si el objeto no quedó activo se re-sube; nunca se
+#      entrega como ✓ un enlace muerto.
+#
+# Ojo: el bucket de toDus sigue siendo público y puede purgar objetos
+# sin aviso (también puede borrarlos cualquier tercero, es anónimo).
+# Ningún cliente puede hacer permanentes los enlaces ahí; para
+# permanencia real usa tu propio S3 con S3_UNSIGNED=0.
+
+class _S3RetryableError(RuntimeError):
+    """Fallo transitorio de subida (red / HTTP 5xx): vale la pena reintentar."""
+
+
+# Extensión -> Content-Type. Se parte del mapa inverso ya definido arriba
+# y se añaden tipos que mimetypes no siempre conoce.
+mimetypes.add_type("application/vnd.android.package-archive", ".apk")
+mimetypes.add_type("video/x-matroska", ".mkv")
+mimetypes.add_type("audio/opus", ".opus")
+_EXT_TO_CONTENT_TYPE = {ext: ct for ct, ext in CONTENT_TYPE_TO_EXT.items()}
+_EXT_TO_CONTENT_TYPE.update({
+    ".pdf": "application/pdf",
+    ".zip": "application/zip",
+    ".rar": "application/vnd.rar",
+    ".7z": "application/x-7z-compressed",
+    ".tar": "application/x-tar",
+    ".gz": "application/gzip",
+    ".txt": "text/plain",
+    ".epub": "application/epub+zip",
+    ".apk": "application/vnd.android.package-archive",
+    ".opus": "audio/opus",
+})
+
+
+def _guess_content_type(filename):
+    """Content-Type real según el nombre (antes todo era octet-stream)."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    return (
+        _EXT_TO_CONTENT_TYPE.get(ext)
+        or mimetypes.guess_type(filename or "")[0]
+        or "application/octet-stream"
+    )
+
+
+def _content_disposition(filename):
+    """Content-Disposition con el nombre original (RFC 5987 si no es ASCII)."""
+    name = os.path.basename(filename or "archivo.bin") or "archivo.bin"
+    try:
+        name.encode("ascii")
+        safe = name.replace("\\", "_").replace('"', "_")
+        return f'attachment; filename="{safe}"'
+    except UnicodeEncodeError:
+        fallback = name.encode("ascii", "replace").decode().replace('"', "_")
+        return (
+            f'attachment; filename="{fallback}"; '
+            f"filename*=UTF-8''{quote(name, safe='')}"
         )
-    return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
+
+
+def build_s3_key(user_id, filename):
+    """Key conforme a la estructura de media de toDus:
+
+        users/tg_<user_id>/telegram/<AAAAMMDD-HHMMSS>-<rand6>/telegram_<rand12>_<nombre>
+
+    Así los archivos quedan bajo el namespace de usuario como en la app
+    real, en vez de sueltos en la raíz del bucket (primeros en purgarse).
+    """
+    safe_name = re.sub(
+        r"[^A-Za-z0-9._-]+", "_", sanitize_filename(filename)
+    ).strip("._") or f"file_{int(time.time())}.bin"
+    if not S3_KEY_PREFIX:
+        # Modo legado plano (solo buckets privados propios; ver S3_KEY_PREFIX)
+        return f"{uuid.uuid4().hex[:8]}_{safe_name}"
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    folder = f"{stamp}-{uuid.uuid4().hex[:6]}"
+    file_id = uuid.uuid4().hex[:12]
+    namespace = f"tg_{user_id}" if user_id else "tg_anon"
+    return (
+        f"{S3_KEY_PREFIX}/{namespace}/telegram/{folder}/"
+        f"telegram_{file_id}_{safe_name}"
+    )
+
+
+def s3_public_url(key):
+    """URL pública de una key (codificando cada segmento, no las '/')."""
+    return (
+        f"{S3_ENDPOINT.rstrip('/')}/{S3_BUCKET.strip('/')}/"
+        f"{quote(key, safe='/')}"
+    )
+
+
+async def _s3_put_direct(temp_path, key, filename, size):
+    """Subida unsigned (toDus): UN solo PUT HTTP con el archivo en streaming.
+
+    Es exactamente el método de todus-client y de los bots que funcionan
+    contra s3.todus.cu. Sin multipart, sin firma, con Content-Type real y
+    Content-Disposition para que la descarga conserve el nombre original.
+    """
+    url = s3_public_url(key)
+    headers = {
+        "Content-Type": _guess_content_type(filename),
+        "Content-Disposition": _content_disposition(filename),
+        "Content-Length": str(size),
+        "User-Agent": _S3_USER_AGENT,
+    }
+    # total=None: el límite global lo pone subir_a_s3 (S3_UPLOAD_TIMEOUT).
+    # sock_read generoso para que una subida lenta no muera entre chunks.
+    timeout = aiohttp.ClientTimeout(
+        total=None, connect=30, sock_connect=30, sock_read=600
+    )
+    f = open(temp_path, "rb")
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Pasar el file object hace que aiohttp fije Content-Length y
+            # lea en streaming (sin Transfer-Encoding: chunked, que los
+            # S3-compatibles no aceptan en un PutObject sin firmar).
+            async with session.put(url, data=f, headers=headers) as resp:
+                if resp.status in (200, 201, 204):
+                    return
+                detail = (await resp.text())[:200].strip()
+                if resp.status >= 500:
+                    raise _S3RetryableError(
+                        f"S3 respondió HTTP {resp.status} al subir: {detail}"
+                    )
+                raise RuntimeError(
+                    f"S3 rechazó la subida (HTTP {resp.status}): {detail}"
+                )
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+        raise _S3RetryableError(f"error de red subiendo a S3: {e}") from e
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+async def _s3_put_signed(temp_path, key, filename, size):
+    """Subida firmada (S3_UNSIGNED=0): boto3 en un hilo, como antes.
+
+    En un S3 de verdad (AWS/MinIO/R2) el multipart de boto3 es correcto;
+    solo se corrigen Content-Type/Content-Disposition y la clasificación
+    de errores reintentables (5xx/red) frente a definitivos (4xx).
+    """
+    def _do_upload():
+        import boto3
+        client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            region_name=S3_REGION,
+            config=_S3_CONFIG,
+        )
+        with open(temp_path, "rb") as f:
+            client.upload_fileobj(
+                f, S3_BUCKET, key,
+                ExtraArgs={
+                    "ContentType": _guess_content_type(filename),
+                    "ContentDisposition": _content_disposition(filename),
+                },
+                Config=_TRANSFER_CONFIG,
+            )
+
+    try:
+        await asyncio.to_thread(_do_upload)
+    except Exception as e:
+        status = None
+        response = getattr(e, "response", None)
+        if isinstance(response, dict):
+            status = (
+                response.get("ResponseMetadata", {}) or {}
+            ).get("HTTPStatusCode")
+        if status and 400 <= int(status) < 500:
+            raise RuntimeError(
+                f"S3 rechazó la subida (HTTP {status}): {str(e)[:200]}"
+            ) from e
+        raise _S3RetryableError(
+            f"error subiendo a S3: {str(e)[:200]}"
+        ) from e
+
+
+def _remote_size(headers):
+    """Tamaño total del objeto según Content-Range o Content-Length."""
+    crange = headers.get("Content-Range", "")
+    if "/" in crange:
+        try:
+            return int(crange.rsplit("/", 1)[1])
+        except (ValueError, IndexError):
+            pass
+    clen = headers.get("Content-Length")
+    if clen is not None:
+        try:
+            return int(clen)
+        except ValueError:
+            pass
+    return None
+
+
+async def _verify_s3_object(url, expected_size):
+    """Comprueba que el objeto recién subido existe y tiene su tamaño.
+
+    Devuelve (estado, detalle):
+      "ok"           -> existe (y el tamaño coincide si el servidor lo dice)
+      "dead"         -> el servidor confirma que NO existe o que el tamaño
+                        difiere (la subida no quedó; hay que re-subir)
+      "unverifiable" -> no se pudo comprobar (403 en bucket privado, HEAD
+                        no soportado, red caída…). No bloquea el enlace:
+                        un chequeo opcional nunca debe tumbar una subida.
+    Solo lee cabeceras: jamás descarga el cuerpo del archivo.
+    """
+    headers = {
+        "User-Agent": _S3_USER_AGENT,
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+    }
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    delay = 1.0
+    last_detail = "sin respuesta del servidor"
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(1, S3_VERIFY_ATTEMPTS + 1):
+                try:
+                    async with session.head(
+                        url, headers=headers, allow_redirects=True
+                    ) as resp:
+                        status = resp.status
+                        resp_headers = resp.headers
+                        if status in (405, 501):
+                            # HEAD no soportado: GET de 1 byte, sin leer cuerpo
+                            async with session.get(
+                                url,
+                                headers={**headers, "Range": "bytes=0-0"},
+                                allow_redirects=True,
+                            ) as get_resp:
+                                status = get_resp.status
+                                resp_headers = get_resp.headers
+                    if status in (200, 206):
+                        remote = _remote_size(resp_headers)
+                        # remote == 0 con tamaño esperado > 0 se trata como
+                        # "tamaño no informado" (hay frontends que devuelven
+                        # Content-Length: 0 en HEAD): no debe tumbar la subida.
+                        if (
+                            remote
+                            and expected_size
+                            and remote != expected_size
+                        ):
+                            return "dead", (
+                                f"tamaño en S3 {format_size(remote)} != "
+                                f"esperado {format_size(expected_size)}"
+                            )
+                        return "ok", f"HTTP {status}"
+                    if status in (401, 403):
+                        return "unverifiable", (
+                            f"HTTP {status} al verificar (bucket no público)"
+                        )
+                    if status in (404, 410):
+                        last_detail = f"HTTP {status} (el objeto no existe)"
+                    elif status >= 500:
+                        last_detail = f"HTTP {status} al verificar"
+                    else:
+                        return "unverifiable", f"HTTP {status} al verificar"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_detail = f"error de red al verificar: {e}"
+                if attempt < S3_VERIFY_ATTEMPTS:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 8.0)
+    except Exception as e:  # la verificación nunca debe romper la subida
+        return "unverifiable", f"verificación no disponible: {e}"
+    # Agotados los intentos: solo un 404/410 confirmado cuenta como muerto;
+    # 5xx/red se tratan como "no verificable" para no tumbar la subida.
+    if "no existe" in last_detail:
+        return "dead", last_detail
+    return "unverifiable", last_detail
+
+
+async def subir_a_s3(temp_path, filename, size, user_id=None):
+    """Sube el archivo a S3 y devuelve su URL pública YA VERIFICADA.
+
+    Reintenta la subida completa (misma key; el PUT es idempotente) ante
+    fallos transitorios de red/5xx o si la verificación posterior dice
+    que el objeto no quedó en el bucket. Si tras los reintentos el enlace
+    seguiría muerto, lanza RuntimeError para que el usuario vea el error
+    y reenvíe, en vez de recibir un ✓ con un enlace que ya venció.
+    """
+    actual_size = os.path.getsize(temp_path)
+    if size and size != actual_size:
+        log.warning(
+            f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
+        )
+    size = actual_size
+
+    key = build_s3_key(user_id, filename)
+    url = s3_public_url(key)
+    put = _s3_put_direct if S3_UNSIGNED else _s3_put_signed
+    last_error = "error desconocido"
+
+    try:
+        async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
+            for attempt in range(1, S3_UPLOAD_RETRIES + 1):
+                try:
+                    await put(temp_path, key, filename, size)
+                except _S3RetryableError as e:
+                    last_error = str(e)
+                    log.warning(
+                        f"S3 intento {attempt}/{S3_UPLOAD_RETRIES} "
+                        f"falló ({key}): {e}"
+                    )
+                    if attempt < S3_UPLOAD_RETRIES:
+                        await asyncio.sleep(min(2 ** attempt, 16))
+                        continue
+                    break
+
+                if not S3_VERIFY_UPLOAD:
+                    log.info(f"S3 subido (sin verificar): {key}")
+                    return url
+
+                state, detail = await _verify_s3_object(url, size)
+                if state == "ok":
+                    log.info(
+                        f"S3 OK verificado: {key} ({format_size(size)})"
+                    )
+                    return url
+                if state == "unverifiable":
+                    log.warning(
+                        f"S3: no se pudo verificar {key} ({detail}); "
+                        f"se entrega el enlace igualmente"
+                    )
+                    return url
+
+                # state == "dead": el PUT dijo 200 pero el objeto no está.
+                # Esto es lo que el usuario veía como "venció al instante".
+                last_error = (
+                    f"el archivo no quedó activo en S3 tras subirlo ({detail})"
+                )
+                log.warning(
+                    f"S3 intento {attempt}/{S3_UPLOAD_RETRIES}: {last_error}"
+                )
+                if attempt < S3_UPLOAD_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+    except (asyncio.TimeoutError, TimeoutError):
+        raise RuntimeError(
+            f"Tiempo agotado ({S3_UPLOAD_TIMEOUT}s) subiendo a S3"
+        )
+
+    raise RuntimeError(
+        f"No se pudo dejar el archivo activo en S3 tras "
+        f"{S3_UPLOAD_RETRIES} intentos: {last_error}. "
+        f"Reenvíalo en unos minutos."
+    )
 
 
 # ============== DOWNLOAD ==============
@@ -786,7 +1150,7 @@ async def _process_tg_media(job):
             _render_status_progress("uploading", filename, size)
         )
 
-        url_final = await subir_a_s3(temp_path, filename, size)
+        url_final = await subir_a_s3(temp_path, filename, size, user_id=job.user_id)
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
@@ -952,7 +1316,7 @@ async def _process_url(job):
             _render_status_progress("uploading", filename, size)
         )
 
-        url_final = await subir_a_s3(temp_path, filename, size)
+        url_final = await subir_a_s3(temp_path, filename, size, user_id=job.user_id)
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
