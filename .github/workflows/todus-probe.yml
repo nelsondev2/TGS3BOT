@@ -1,0 +1,23 @@
+# TEMPORAL: diagnóstico de supervivencia de keys en s3.todus.cu.
+# Solo se dispara con pushes a la rama de diagnóstico que toquen el
+# script o este workflow. NO mergear a main.
+name: todus-probe
+on:
+  push:
+    branches: [arena/fb207c55-tgs3bot]
+    paths:
+      - scripts/probe_todus.py
+      - .github/workflows/todus-probe.yml
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "aiohttp>=3.10"
+      - run: python scripts/probe_todus.py
+        env:
+          PROBE_MINUTES: "13"
