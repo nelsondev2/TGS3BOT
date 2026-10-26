@@ -1,5 +1,5 @@
 """
-PROBE TEMPORAL de diagnóstico contra s3.todus.cu (NO es parte del bot).
+Script de diagnóstico contra s3.todus.cu (no es parte del bot).
 
 Sube archivos de texto diminutos con distintos patrones de key y dos
 transportes distintos, comprueba cuáles siguen vivos en intervalos de

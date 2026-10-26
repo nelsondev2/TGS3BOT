@@ -45,10 +45,13 @@ services:
       - key: S3_UNSIGNED
         value: "1"
       - key: S3_KEY_PREFIX
-        # "users" = keys users/tg_<id>/telegram/... como la app de toDus.
-        # NO uses keys en la raíz del bucket: son las primeras que se purgan
-        # y los enlaces vencen casi al instante.
-        value: "users"
+        # Namespace que SOBREVIVE en toDus (medido con scripts/probe_todus.py):
+        # el bucket barre en <2 min todo lo que no esté bajo users/df/, hi/ o dk/.
+        # Keys resultantes: users/df/<user_id>/<nombre>_<rand>.<ext>
+        # OJO: si tu servicio ya tenía "users" de la versión anterior, este
+        # valor lo sustituye al sincronizar el Blueprint (el código también
+        # mapea "users" -> "users/df" por compatibilidad).
+        value: "users/df"
       - key: S3_VERIFY_UPLOAD
         # "1" = comprobar con HEAD que el objeto existe antes de entregar el enlace
         value: "1"

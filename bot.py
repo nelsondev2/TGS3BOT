@@ -14,10 +14,10 @@ Mejoras aplicadas:
 - Allowlist de usuarios (ALLOWED_TG_IDS)
 - URL S3 SIEMPRE visible al usuario
 - Llamadas síncronas envueltas con asyncio.to_thread
-- Subida a toDus con PUT directo (sin multipart de boto3) y keys
-  users/tg_<id>/telegram/... como la app real: las keys en la raíz
-  del bucket público eran las primeras en purgarse y los enlaces
-  vencían casi al instante
+- Subida a toDus con PUT directo (sin multipart de boto3) y keys bajo
+  users/df/<id>/...: el bucket barre en minutos cualquier key fuera de
+  los namespaces permitidos (users/df/, hi/, dk/) — medido con
+  scripts/probe_todus.py; por eso los enlaces vencían casi al instante
 - Verificación post-subida (HEAD + tamaño) antes de entregar el
   enlace, con re-subida automática si el objeto no quedó activo
 - Descarga paralela robusta: rechaza respuestas 200 OK en peticiones Range
@@ -85,14 +85,25 @@ S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "public")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "public")
 S3_UNSIGNED = os.environ.get("S3_UNSIGNED", "1") == "1"
-# Namespace de las keys dentro del bucket. Con toDus los archivos DEBEN ir
-# bajo "users/tg_<id>/telegram/..." (la estructura que usa la propia app):
-# las keys sueltas en la raíz del bucket público son las primeras que
-# purgan los barridos de limpieza y los enlaces "vencen" casi al instante.
-# Pon S3_KEY_PREFIX=none solo si usas tu propio bucket privado y quieres
-# las keys planas de la versión anterior (NO recomendado en toDus).
-_key_prefix_env = os.environ.get("S3_KEY_PREFIX", "users").strip().strip("/")
-S3_KEY_PREFIX = "" if _key_prefix_env.lower() in ("none", "-") else (_key_prefix_env or "users")
+# Namespace de las keys dentro del bucket. IMPORTANTE (medido el
+# 2026-10-26 con scripts/probe_todus.py desde una IP extranjera): el
+# bucket público de toDus BARRE en menos de 2 minutos cualquier objeto
+# cuya key no esté bajo un namespace permitido. Sobreviven: users/df/,
+# hi/ y dk/ (este último incluso dk/tg_<id>/). Mueren casi al instante:
+# la raíz, users/tg_* y cualquier namespace inventado. El transporte,
+# el User-Agent y el nombre de archivo son irrelevantes: solo manda
+# la key. Por eso los enlaces "vencían" aunque la subida y la
+# verificación inmediata fueran correctas.
+# Formato resultante: "{S3_KEY_PREFIX}/<user_id>/<archivo>"; también
+# se acepta el placeholder {user_id} dentro del prefijo (ej.
+# "dk/tg_{user_id}"). "none" = keys planas en la raíz (solo para tu
+# propio bucket; en toDus morirían en minutos).
+_key_prefix_env = os.environ.get("S3_KEY_PREFIX", "users/df").strip().strip("/")
+if _key_prefix_env == "users":
+    # Valor del render.yaml de la versión anterior: "users" a secas
+    # daría users/<id>/... (forma no probada); se mapea al refugio df.
+    _key_prefix_env = "users/df"
+S3_KEY_PREFIX = "" if _key_prefix_env.lower() in ("none", "-") else (_key_prefix_env or "users/df")
 # Reintentos de subida (PUT + verificación) ante fallos transitorios.
 S3_UPLOAD_RETRIES = max(1, int(os.environ.get("S3_UPLOAD_RETRIES", "3") or "3"))
 # Tiempo total máximo (segundos) para subir y verificar un archivo.
@@ -161,9 +172,9 @@ log = logging.getLogger("bot")
 # --- S3 Config ---
 # Solo se usa boto3 en modo firmado (S3_UNSIGNED=0, un S3 de verdad tipo
 # AWS/MinIO/R2). En modo unsigned (toDus, el default) la subida es un PUT
-# HTTP directo con aiohttp — ver _s3_put_direct. El multipart de boto3
-# contra el backend de toDus dejaba objetos sin ensamblar/purgables y los
-# enlaces nacían muertos o vencían casi al instante.
+# HTTP directo con aiohttp — ver _s3_put_direct: es el transporte que
+# usan los clientes estables contra ese backend (MinIO) y el que quedó
+# verificado en vivo con scripts/probe_todus.py.
 _S3_CONFIG = BotoConfig(
     signature_version=UNSIGNED if S3_UNSIGNED else "s3v4",
     retries={"max_attempts": 3, "mode": "adaptive"},
@@ -548,25 +559,27 @@ async def tg_edit_status(chat_id, msg, text):
 #      UploadPart / CompleteMultipartUpload). El backend de toDus no es
 #      AWS: los clientes que funcionan de forma estable contra
 #      s3.todus.cu (todus-client y los demás bots públicos) suben con un
-#      PUT HTTP directo, en una sola petición, sin firmar. Con multipart
-#      el objeto puede quedar sin ensamblar o como upload incompleto, y
-#      el enlace nace muerto o cae en la primera purga.
-#   2. Las keys iban sueltas en la RAÍZ del bucket ("a1b2c3d4_x.mp4").
-#      El bucket es público y anónimo también para LISTAR y BORRAR: las
-#      keys de la raíz salen las primeras en cualquier ListObjects y son
-#      las primeras que purgan los barridos de limpieza. La estructura
-#      que usa la propia app de toDus es "users/<usuario>/...", y es la
-#      que hay que imitar para que los archivos se traten como media
-#      normal de la plataforma.
+#      PUT HTTP directo, en una sola petición, sin firmar. (Este
+#      transporte, con keys en el namespace correcto, es el que quedó
+#      verificado en vivo contra el bucket real.)
+#   2. El NAMESPACE de la key (la causa principal del "vence casi al
+#      instante", medida con scripts/probe_todus.py): un barrido del
+#      bucket borra en <2 min todo objeto fuera de los namespaces
+#      permitidos (users/df/, hi/, dk/), aunque el PUT devuelva 200 y
+#      la verificación HEAD inmediata pase. La raíz de la v1 y el
+#      patrón users/tg_<id>/telegram/... de la v2 murieron igual de
+#      rápido. Por eso las keys ahora son users/df/<user_id>/..., como
+#      los objetos que sí sobreviven horas en el bucket.
 #   3. La URL se entregaba al usuario sin comprobar que el objeto
 #      existiera. Ahora se verifica con HEAD (y el tamaño) antes de
 #      responder, y si el objeto no quedó activo se re-sube; nunca se
 #      entrega como ✓ un enlace muerto.
 #
-# Ojo: el bucket de toDus sigue siendo público y puede purgar objetos
-# sin aviso (también puede borrarlos cualquier tercero, es anónimo).
-# Ningún cliente puede hacer permanentes los enlaces ahí; para
-# permanencia real usa tu propio S3 con S3_UNSIGNED=0.
+# Ojo: aun dentro de users/df/, el bucket es público y anónimo
+# también para borrar, y toDus puede cambiar mañana qué namespaces
+# respeta su barrido. Si los enlaces volvieran a caer, re-mide con
+# scripts/probe_todus.py y ajusta S3_KEY_PREFIX. Para permanencia
+# real, usa tu propio S3 con S3_UNSIGNED=0.
 
 class _S3RetryableError(RuntimeError):
     """Fallo transitorio de subida (red / HTTP 5xx): vale la pena reintentar."""
@@ -618,27 +631,35 @@ def _content_disposition(filename):
 
 
 def build_s3_key(user_id, filename):
-    """Key conforme a la estructura de media de toDus:
+    """Key dentro de un namespace que el barrido de toDus respeta:
 
-        users/tg_<user_id>/telegram/<AAAAMMDD-HHMMSS>-<rand6>/telegram_<rand12>_<nombre>
+        users/df/<user_id>/<stem>_<rand8><ext>     (por defecto)
 
-    Así los archivos quedan bajo el namespace de usuario como en la app
-    real, en vez de sueltos en la raíz del bucket (primeros en purgarse).
+    Es la forma exacta de los objetos que sobreviven horas en el
+    bucket (verificado en vivo con scripts/probe_todus.py). El sufijo
+    _<rand8> evita que dos subidas con el mismo nombre se sobrescriban
+    (los nombres con sufijos numéricos son habituales en el bucket y
+    también sobrevivieron al probe). El nombre de descarga real va en
+    Content-Disposition, así que el usuario conserva su nombre original.
+    S3_KEY_PREFIX admite el placeholder {user_id} (ej. dk/tg_{user_id}).
     """
     safe_name = re.sub(
         r"[^A-Za-z0-9._-]+", "_", sanitize_filename(filename)
     ).strip("._") or f"file_{int(time.time())}.bin"
-    if not S3_KEY_PREFIX:
-        # Modo legado plano (solo buckets privados propios; ver S3_KEY_PREFIX)
-        return f"{uuid.uuid4().hex[:8]}_{safe_name}"
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    folder = f"{stamp}-{uuid.uuid4().hex[:6]}"
-    file_id = uuid.uuid4().hex[:12]
-    namespace = f"tg_{user_id}" if user_id else "tg_anon"
-    return (
-        f"{S3_KEY_PREFIX}/{namespace}/telegram/{folder}/"
-        f"telegram_{file_id}_{safe_name}"
+    stem, ext = os.path.splitext(safe_name)
+    unique_name = (
+        f"{stem}_{uuid.uuid4().hex[:8]}{ext}" if stem else safe_name
     )
+    if not S3_KEY_PREFIX:
+        # Sin namespace: raíz del bucket (solo buckets propios; en
+        # toDus el barrido lo eliminaría en minutos).
+        return unique_name
+    uid = str(user_id) if user_id else "0"
+    if "{user_id}" in S3_KEY_PREFIX:
+        base = S3_KEY_PREFIX.replace("{user_id}", uid).strip("/")
+    else:
+        base = f"{S3_KEY_PREFIX}/{uid}"
+    return f"{base}/{unique_name}"
 
 
 def s3_public_url(key):
@@ -676,6 +697,21 @@ async def _s3_put_direct(temp_path, key, filename, size):
             # S3-compatibles no aceptan en un PutObject sin firmar).
             async with session.put(url, data=f, headers=headers) as resp:
                 if resp.status in (200, 201, 204):
+                    # Un PutObject correcto devuelve cuerpo vacío. Algunos
+                    # backends responden 200 con un <Error> XML dentro:
+                    # eso NO es una subida válida aunque el status lo sea.
+                    body = await resp.text()
+                    if "<Error>" in body:
+                        raise _S3RetryableError(
+                            f"S3 devolvió un error con HTTP {resp.status}: "
+                            f"{body[:200].strip()}"
+                        )
+                    if not resp.headers.get("ETag"):
+                        log.warning(
+                            "S3: PUT %s sin ETag en la respuesta (%s); "
+                            "se fía de la verificación posterior",
+                            resp.status, key,
+                        )
                     return
                 detail = (await resp.text())[:200].strip()
                 if resp.status >= 500:
@@ -810,14 +846,29 @@ async def _verify_s3_object(url, expected_size):
                             )
                         return "ok", f"HTTP {status}"
                     if status in (401, 403):
-                        return "unverifiable", (
-                            f"HTTP {status} al verificar (bucket no público)"
-                        )
-                    if status in (404, 410):
+                        if S3_UNSIGNED:
+                            # Bucket público (toDus): la lectura anónima
+                            # funciona, así que un 403 al verificar es un
+                            # problema real del objeto, no de permisos.
+                            last_detail = (
+                                f"HTTP {status} (el objeto no existe o "
+                                f"no es accesible)"
+                            )
+                        else:
+                            # Bucket privado firmado: un 403 anónimo es
+                            # esperable aunque el objeto exista.
+                            return "unverifiable", (
+                                f"HTTP {status} al verificar "
+                                f"(bucket no público)"
+                            )
+                    elif status in (404, 410):
                         last_detail = f"HTTP {status} (el objeto no existe)"
                     elif status >= 500:
                         last_detail = f"HTTP {status} al verificar"
                     else:
+                        # Cualquier otro status raro (el 401/403 en modo
+                        # público ya quedó tratado arriba como "no
+                        # existe" y sigue el bucle de reintentos).
                         return "unverifiable", f"HTTP {status} al verificar"
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_detail = f"error de red al verificar: {e}"
