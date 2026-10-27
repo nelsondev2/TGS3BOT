@@ -14,12 +14,13 @@ Mejoras aplicadas:
 - Allowlist de usuarios (ALLOWED_TG_IDS)
 - URL S3 SIEMPRE visible al usuario
 - Llamadas síncronas envueltas con asyncio.to_thread
-- Subida a toDus con PUT directo (sin multipart de boto3) y keys bajo
-  users/df/<id>/...: el bucket barre en minutos cualquier key fuera de
-  los namespaces permitidos (users/df/, hi/, dk/) — medido con
-  scripts/probe_todus.py; por eso los enlaces vencían casi al instante
-- Verificación post-subida (HEAD + tamaño) antes de entregar el
-  enlace, con re-subida automática si el objeto no quedó activo
+- Subida a toDus con PUT directo (sin multipart de boto3) y ESPEJOS en
+  varios namespaces: el bucket barre sin aviso namespaces enteros —
+  medido con scripts/probe_todus.py; por eso los enlaces vencían casi
+  al instante. Se entrega enlace principal + espejo en otro namespace
+- Verificación post-subida (HEAD + tamaño) y espera anti-barrido
+  antes de entregar el enlace, con caída automática al siguiente
+  namespace (y memoria del que sobrevivió) si el objeto desaparece
 - Descarga paralela robusta: rechaza respuestas 200 OK en peticiones Range
 - Limpieza de archivos .part en cancelación/fallo
 - Detección de Content-Type cuando la URL no tiene extensión clara
@@ -35,6 +36,9 @@ import time
 import uuid
 import signal
 import asyncio
+import json
+import io
+import hashlib
 import logging
 import mimetypes
 import threading
@@ -86,22 +90,35 @@ S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "public")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "public")
 S3_UNSIGNED = os.environ.get("S3_UNSIGNED", "1") == "1"
 # Namespace de las keys dentro del bucket. IMPORTANTE (medido el
-# 2026-10-26 con scripts/probe_todus.py desde una IP extranjera): el
-# bucket público de toDus BARRE en menos de 2 minutos cualquier objeto
-# cuya key no esté bajo un namespace permitido. Sobreviven: users/df/,
-# hi/ y dk/ (este último incluso dk/tg_<id>/). Mueren casi al instante:
-# la raíz, users/tg_* y cualquier namespace inventado. El transporte,
-# el User-Agent y el nombre de archivo son irrelevantes: solo manda
-# la key. Por eso los enlaces "vencían" aunque la subida y la
-# verificación inmediata fueran correctas.
-# Formato resultante: "{S3_KEY_PREFIX}/<user_id>/<archivo>"; también
-# se acepta el placeholder {user_id} dentro del prefijo (ej.
+# 2026-10-26/27 con scripts/probe_todus.py desde una IP extranjera):
+# el bucket público de toDus BARRE los objetos anónimos según el
+# namespace de la key, y las reglas cambian sin aviso:
+#   - raíz, users/tg_*, video/ y cualquier namespace inventado:
+#     muertos en <2 min (ambos días).
+#   - dk/: refugio el día 26 (objetos de días); el 27 amaneció vacío
+#     y todo lo nuevo murió en <2 min.
+#   - users/df/: refugio el día 26; el 27 sobrevivía 10 min pero a
+#     los 18 min ya estaba borrado.
+#   - hi/: vivo tras 28 min el día 27, con objetos de ~16 h en el
+#     bucket: hoy es el refugio más sólido.
+# El transporte, el User-Agent y el nombre de archivo son
+# irrelevantes: solo manda la key. Por eso los enlaces "vencían"
+# aunque la subida y la verificación inmediata fueran correctas, y
+# por eso ya no se usa UN namespace fijo sino la lista de candidatos
+# de más abajo (S3_KEY_PREFIXES), con espejos y memoria del ganador.
+# S3_KEY_PREFIX (singular) queda solo como compatibilidad: los
+# valores heredados "users"/"users/df" se interpretan como "usar la
+# lista de candidatos por defecto"; cualquier otro valor explícito
+# se respeta como único namespace.
+# Formato resultante: "<prefijo>/<user_id>/<archivo>"; también se
+# acepta el placeholder {user_id} dentro del prefijo (ej.
 # "dk/tg_{user_id}"). "none" = keys planas en la raíz (solo para tu
 # propio bucket; en toDus morirían en minutos).
 _key_prefix_env = os.environ.get("S3_KEY_PREFIX", "users/df").strip().strip("/")
 if _key_prefix_env == "users":
     # Valor del render.yaml de la versión anterior: "users" a secas
-    # daría users/<id>/... (forma no probada); se mapea al refugio df.
+    # daría users/<id>/... (muerta en <2 min); se normaliza al valor
+    # heredado "users/df" (= lista de candidatos por defecto).
     _key_prefix_env = "users/df"
 S3_KEY_PREFIX = "" if _key_prefix_env.lower() in ("none", "-") else (_key_prefix_env or "users/df")
 # Reintentos de subida (PUT + verificación) ante fallos transitorios.
@@ -113,6 +130,45 @@ S3_UPLOAD_TIMEOUT = int(os.environ.get("S3_UPLOAD_TIMEOUT", "1800") or "1800")
 # y el usuario descubre el 404 al tocar el enlace.
 S3_VERIFY_UPLOAD = os.environ.get("S3_VERIFY_UPLOAD", "1") == "1"
 S3_VERIFY_ATTEMPTS = max(1, int(os.environ.get("S3_VERIFY_ATTEMPTS", "6") or "6"))
+# Namespaces CANDIDATOS (en orden). Las reglas del barrido de toDus
+# cambian sin aviso (dk/ era refugio el 2026-10-26 y amaneció vacío el
+# 27), así que el bot no se casa con uno solo: sube a S3_MIRRORS de
+# estos namespaces y entrega TODOS los enlaces resultantes (principal
+# + espejo). Si mañana tumba un namespace entero, el espejo en otro
+# sigue vivo. El orden se auto-ajusta: el último que
+# sobrevivió pasa a ser el primero (memoria en
+# DOWNLOAD_PATH/s3_namespace_state.json).
+_DEFAULT_KEY_PREFIXES = ["hi", "users/df", "dk/tg_{user_id}"]
+_prefixes_env = os.environ.get("S3_KEY_PREFIXES", "").strip()
+if _prefixes_env:
+    S3_KEY_PREFIXES = []
+    for _pfx in _prefixes_env.split(","):
+        _pfx = _pfx.strip().strip("/")
+        if _pfx == "users":
+            _pfx = "users/df"
+        if _pfx and _pfx.lower() not in ("none", "-") and _pfx not in S3_KEY_PREFIXES:
+            S3_KEY_PREFIXES.append(_pfx)
+    if not S3_KEY_PREFIXES:
+        S3_KEY_PREFIXES = list(_DEFAULT_KEY_PREFIXES)
+elif S3_KEY_PREFIX == "":
+    S3_KEY_PREFIXES = [""]  # "none" explícito: raíz (solo bucket propio)
+elif S3_KEY_PREFIX != "users/df":
+    # Elección explícita distinta del default anterior: se respeta tal cual.
+    S3_KEY_PREFIXES = [S3_KEY_PREFIX]
+else:
+    # "users/df" (o sin configurar) = despliegue heredado: ya NO es
+    # df-primero, sino la lista completa de candidatos por defecto.
+    S3_KEY_PREFIXES = list(_DEFAULT_KEY_PREFIXES)
+# A cuántos namespaces subir cada archivo (1 = sin espejo). Solo aplica
+# en modo unsigned; con tu propio S3 firmado siempre es 1.
+S3_MIRRORS = max(1, int(os.environ.get("S3_MIRRORS", "2") or "2"))
+# Espera anti-barrido: tras subir y verificar, se espera este tiempo y
+# se vuelve a comprobar que el objeto sigue vivo ANTES de entregar el
+# enlace (el barrido rápido medido actúa en <2 min). Ojo: también hay
+# barridos lentos (users/df/ murió a los 10-18 min el 2026-10-27) que
+# ninguna espera razonable caza: contra esos protege el ESPEJO en otro
+# namespace, no el settle. 0 = desactivada.
+S3_SETTLE_SECONDS = int(os.environ.get("S3_SETTLE_SECONDS", "150") or "0")
 
 # --- Servidor ---
 PORT = int(os.environ.get("PORT", "10000"))
@@ -143,6 +199,16 @@ ALWAYS_SHOW_S3_URL = os.environ.get("ALWAYS_SHOW_S3_URL", "1") == "1"
 # Cambiar a "1" para que por defecto SÍ se reenvíe el archivo.
 # Los usuarios pueden activar/desactivar con /sendfile.
 SEND_FILE_VIA_TG = os.environ.get("SEND_FILE_VIA_TG", "0") == "1"
+# Manifiesto .udyat para descargar "sin gastar megas" vía la IP gratuita
+# de toDus (sistema UDYAT / app IroS3Dl; solo desde la red de ETECSA en
+# Cuba). Es un JSON de ~300 B, así que el interruptor global va en "1"
+# (a diferencia de SEND_FILE_VIA_TG, aquí no hay riesgo de gastar datos):
+# solo lo recibe quien lo activa con /udyat, y solo si el S3 en uso es
+# s3.todus.cu. "0" desactiva la función por completo.
+SEND_UDYAT_VIA_TG = os.environ.get("SEND_UDYAT_VIA_TG", "1") == "1"
+# IP que ETECSA no factura para s3.todus.cu (puede cambiar; respaldo
+# conocido: 152.207.206.88).
+UDYAT_FREE_IP = os.environ.get("UDYAT_FREE_IP", "152.207.206.86").strip() or "152.207.206.86"
 
 # --- HTTP Headers ---
 BROWSER_HEADERS = {
@@ -400,7 +466,8 @@ ICON_CLOUD = "☁"
 
 
 def _render_result_card(name, ext, size, s3_url, kind="archivo",
-                         source=None, send_file=False, sent_as=None):
+                         source=None, send_file=False, sent_as=None,
+                         mirror_url=None):
     """Genera la tarjeta final del resultado.
 
     Formato limpio y profesional:
@@ -431,17 +498,22 @@ def _render_result_card(name, ext, size, s3_url, kind="archivo",
 
     lines.append("")  # separador
     lines.append(f"{ICON_LINK} {s3_url}")
+    if mirror_url:
+        # Segundo enlace al mismo archivo en otro namespace: si toDus
+        # tumba un namespace entero, el espejo puede seguir vivo.
+        lines.append(f"{ICON_LINK} {mirror_url} (espejo)")
     return "\n".join(lines)
 
 
 def _render_status_progress(step, filename=None, size=None):
     """Estado de progreso minimalista.
 
-    step: 'downloading' | 'uploading' | 'receiving'
+    step: 'downloading' | 'uploading' | 'receiving' | 'verifying'
     """
     icons = {"downloading": f"{ICON_PROCESSING} Descargando",
              "uploading": f"{ICON_PROCESSING} Subiendo",
-             "receiving": f"{ICON_PROCESSING} Recibiendo"}
+             "receiving": f"{ICON_PROCESSING} Recibiendo",
+             "verifying": f"{ICON_PROCESSING} Verificando enlace"}
     base = icons.get(step, f"{ICON_PROCESSING} Procesando")
     parts = [base]
     if filename:
@@ -473,11 +545,13 @@ def _render_help(is_userbot=False):
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
         "Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.",
+        "Para descargar sin gastar megas (solo Cuba): activa /udyat y te envío el manifiesto para la app IroS3Dl. Con 1DM+: cambia el host del enlace por 152.207.206.86 y añade las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`.",
         "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
+        "  /udyat — toggle: manifiesto .udyat (descargar sin megas en Cuba)",
     ]
     if is_userbot:
         lines.extend([
@@ -493,6 +567,20 @@ def _render_sendfile_state(enabled):
         return f"{ICON_DONE} Modo archivo activado\n\nA partir de ahora recibirás el archivo además de la URL."
     else:
         return f"{ICON_DONE} Modo archivo desactivado\n\nSolo recibirás la URL S3 (ahorra datos en toDus)."
+
+
+def _render_udyat_state(enabled):
+    if enabled:
+        return (
+            f"{ICON_DONE} Manifiesto UDYAT activado\n\n"
+            "Tras cada subida te enviaré también el archivo .udyat para "
+            "descargar SIN gastar megas: impórtalo en la app IroS3Dl "
+            "(mantén presionado el botón ➕ en Descargas). "
+            "Solo funciona desde la red de ETECSA en Cuba; prueba con un "
+            "archivo pequeño y revisa tu saldo la primera vez."
+        )
+    else:
+        return f"{ICON_DONE} Manifiesto UDYAT desactivado\n\nSolo recibirás la URL S3."
 
 
 def _render_unauthorized():
@@ -563,26 +651,36 @@ async def tg_edit_status(chat_id, msg, text):
 #      transporte, con keys en el namespace correcto, es el que quedó
 #      verificado en vivo contra el bucket real.)
 #   2. El NAMESPACE de la key (la causa principal del "vence casi al
-#      instante", medida con scripts/probe_todus.py): un barrido del
-#      bucket borra en <2 min todo objeto fuera de los namespaces
-#      permitidos (users/df/, hi/, dk/), aunque el PUT devuelva 200 y
-#      la verificación HEAD inmediata pase. La raíz de la v1 y el
-#      patrón users/tg_<id>/telegram/... de la v2 murieron igual de
-#      rápido. Por eso las keys ahora son users/df/<user_id>/..., como
-#      los objetos que sí sobreviven horas en el bucket.
+#      instante", medida con scripts/probe_todus.py el 2026-10-26/27):
+#      un barrido del bucket borra los objetos según el namespace de
+#      la key, aunque el PUT devuelva 200 y la verificación HEAD
+#      inmediata pase. La raíz, users/tg_*, video/ y namespaces
+#      inventados mueren en <2 min. Y los "refugios" ROTAN sin aviso:
+#      dk/ era refugio el día 26 y cementerio (<2 min) el 27;
+#      users/df/ pasó de refugio a morir a los 10-18 min; hi/ aguantó
+#      ≥28 min y guarda objetos de ~16 h. Conclusión: ningún
+#      namespace fijo sirve para siempre. Por eso subir_a_s3() sube a
+#      S3_MIRRORS namespaces candidatos (hoy: hi/ primero, luego
+#      users/df/), entrega principal + espejo, y recuerda cuál
+#      sobrevivió para probarlo primero la próxima vez.
 #   3. La URL se entregaba al usuario sin comprobar que el objeto
-#      existiera. Ahora se verifica con HEAD (y el tamaño) antes de
-#      responder, y si el objeto no quedó activo se re-sube; nunca se
-#      entrega como ✓ un enlace muerto.
+#      existiera. Ahora se verifica con HEAD (y el tamaño) tras una
+#      espera anti-barrido; si el objeto desapareció se cae al
+#      siguiente namespace. Nunca se entrega como ✓ un enlace muerto.
 #
-# Ojo: aun dentro de users/df/, el bucket es público y anónimo
-# también para borrar, y toDus puede cambiar mañana qué namespaces
-# respeta su barrido. Si los enlaces volvieran a caer, re-mide con
-# scripts/probe_todus.py y ajusta S3_KEY_PREFIX. Para permanencia
-# real, usa tu propio S3 con S3_UNSIGNED=0.
+# Ojo: el bucket es público y anónimo también para borrar, y toDus
+# puede cambiar mañana qué namespaces respeta su barrido. Si los
+# enlaces volvieran a caer, re-mide con scripts/probe_todus.py y
+# ajusta S3_KEY_PREFIXES. La vía con garantías es subir por el flujo
+# oficial de toDus (reserva XMPP todus:purl con una cuenta de toDus,
+# ver ToDus-SDK) o usar tu propio S3 con S3_UNSIGNED=0.
 
 class _S3RetryableError(RuntimeError):
     """Fallo transitorio de subida (red / HTTP 5xx): vale la pena reintentar."""
+
+
+class _S3UploadExhausted(RuntimeError):
+    """Se agotaron los reintentos en UN namespace (probar el siguiente)."""
 
 
 # Extensión -> Content-Type. Se parte del mapa inverso ya definido arriba
@@ -630,10 +728,11 @@ def _content_disposition(filename):
         )
 
 
-def build_s3_key(user_id, filename):
-    """Key dentro de un namespace que el barrido de toDus respeta:
+def build_s3_key(user_id, filename, prefix=None):
+    """Key dentro de un namespace candidato:
 
-        users/df/<user_id>/<stem>_<rand8><ext>     (por defecto)
+        <prefijo>/<user_id>/<stem>_<rand8><ext>
+        (hoy el primer candidato es hi: hi/<user_id>/...)
 
     Es la forma exacta de los objetos que sobreviven horas en el
     bucket (verificado en vivo con scripts/probe_todus.py). El sufijo
@@ -641,7 +740,7 @@ def build_s3_key(user_id, filename):
     (los nombres con sufijos numéricos son habituales en el bucket y
     también sobrevivieron al probe). El nombre de descarga real va en
     Content-Disposition, así que el usuario conserva su nombre original.
-    S3_KEY_PREFIX admite el placeholder {user_id} (ej. dk/tg_{user_id}).
+    El prefijo admite el placeholder {user_id} (ej. dk/tg_{user_id}).
     """
     safe_name = re.sub(
         r"[^A-Za-z0-9._-]+", "_", sanitize_filename(filename)
@@ -650,15 +749,16 @@ def build_s3_key(user_id, filename):
     unique_name = (
         f"{stem}_{uuid.uuid4().hex[:8]}{ext}" if stem else safe_name
     )
-    if not S3_KEY_PREFIX:
+    pfx = S3_KEY_PREFIX if prefix is None else prefix
+    if not pfx:
         # Sin namespace: raíz del bucket (solo buckets propios; en
         # toDus el barrido lo eliminaría en minutos).
         return unique_name
     uid = str(user_id) if user_id else "0"
-    if "{user_id}" in S3_KEY_PREFIX:
-        base = S3_KEY_PREFIX.replace("{user_id}", uid).strip("/")
+    if "{user_id}" in pfx:
+        base = pfx.replace("{user_id}", uid).strip("/")
     else:
-        base = f"{S3_KEY_PREFIX}/{uid}"
+        base = f"{pfx}/{uid}"
     return f"{base}/{unique_name}"
 
 
@@ -668,6 +768,53 @@ def s3_public_url(key):
         f"{S3_ENDPOINT.rstrip('/')}/{S3_BUCKET.strip('/')}/"
         f"{quote(key, safe='/')}"
     )
+
+
+# --- Memoria del orden de namespaces ---
+# El barrido de toDus cambia qué namespaces respeta (dk/ cayó de un
+# día para otro). El bot recuerda cuál sobrevivió la última vez y lo
+# prueba primero; el que muere pasa al final. Se persiste en disco
+# para sobrevivir reinicios (si el disco es efímero, se re-aprende).
+_NS_STATE_FILE = os.path.join(DOWNLOAD_PATH, "s3_namespace_state.json")
+_ns_order = None
+
+
+def _ns_candidates():
+    """Namespaces candidatos, con el último ganador primero."""
+    global _ns_order
+    if _ns_order is None:
+        order = []
+        try:
+            with open(_NS_STATE_FILE) as fh:
+                saved = json.load(fh).get("order", [])
+            order = [x for x in saved if x in S3_KEY_PREFIXES]
+        except Exception:
+            pass
+        order += [x for x in S3_KEY_PREFIXES if x not in order]
+        _ns_order = order or list(S3_KEY_PREFIXES) or [""]
+    return list(_ns_order)
+
+
+def _ns_reorder(winner=None, loser=None):
+    """Sube el namespace ganador al frente / hunde el perdedor (sync)."""
+    global _ns_order
+    order = _ns_candidates()
+    changed = False
+    if loser in order and order[-1] != loser:
+        order.remove(loser)
+        order.append(loser)
+        changed = True
+    if winner in order and order[0] != winner:
+        order.remove(winner)
+        order.insert(0, winner)
+        changed = True
+    _ns_order = order
+    if changed:
+        try:
+            with open(_NS_STATE_FILE, "w") as fh:
+                json.dump({"order": order}, fh)
+        except Exception:
+            pass
 
 
 async def _s3_put_direct(temp_path, key, filename, size):
@@ -884,27 +1031,16 @@ async def _verify_s3_object(url, expected_size):
     return "unverifiable", last_detail
 
 
-async def subir_a_s3(temp_path, filename, size, user_id=None):
-    """Sube el archivo a S3 y devuelve su URL pública YA VERIFICADA.
+async def _upload_and_verify(temp_path, key, url, filename, size):
+    """Sube a UNA key con reintentos y verifica que el objeto quedó.
 
-    Reintenta la subida completa (misma key; el PUT es idempotente) ante
-    fallos transitorios de red/5xx o si la verificación posterior dice
-    que el objeto no quedó en el bucket. Si tras los reintentos el enlace
-    seguiría muerto, lanza RuntimeError para que el usuario vea el error
-    y reenvíe, en vez de recibir un ✓ con un enlace que ya venció.
+    Devuelve None si el objeto quedó activo (o no verificable en un
+    bucket privado). Lanza _S3UploadExhausted si se agotan los
+    reintentos en este namespace; los errores 4xx definitivos del PUT
+    se propagan como RuntimeError (fallar rápido, como siempre).
     """
-    actual_size = os.path.getsize(temp_path)
-    if size and size != actual_size:
-        log.warning(
-            f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
-        )
-    size = actual_size
-
-    key = build_s3_key(user_id, filename)
-    url = s3_public_url(key)
     put = _s3_put_direct if S3_UNSIGNED else _s3_put_signed
     last_error = "error desconocido"
-
     try:
         async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
             for attempt in range(1, S3_UPLOAD_RETRIES + 1):
@@ -923,23 +1059,22 @@ async def subir_a_s3(temp_path, filename, size, user_id=None):
 
                 if not S3_VERIFY_UPLOAD:
                     log.info(f"S3 subido (sin verificar): {key}")
-                    return url
+                    return
 
                 state, detail = await _verify_s3_object(url, size)
                 if state == "ok":
                     log.info(
                         f"S3 OK verificado: {key} ({format_size(size)})"
                     )
-                    return url
+                    return
                 if state == "unverifiable":
                     log.warning(
                         f"S3: no se pudo verificar {key} ({detail}); "
-                        f"se entrega el enlace igualmente"
+                        f"se da por bueno provisionalmente"
                     )
-                    return url
+                    return
 
                 # state == "dead": el PUT dijo 200 pero el objeto no está.
-                # Esto es lo que el usuario veía como "venció al instante".
                 last_error = (
                     f"el archivo no quedó activo en S3 tras subirlo ({detail})"
                 )
@@ -952,13 +1087,123 @@ async def subir_a_s3(temp_path, filename, size, user_id=None):
         raise RuntimeError(
             f"Tiempo agotado ({S3_UPLOAD_TIMEOUT}s) subiendo a S3"
         )
+    raise _S3UploadExhausted(last_error)
 
-    raise RuntimeError(
-        f"No se pudo dejar el archivo activo en S3 tras "
-        f"{S3_UPLOAD_RETRIES} intentos: {last_error}. "
-        f"Reenvíalo en unos minutos."
-    )
 
+async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
+    """Sube el archivo a S3 y devuelve (url_principal, [urls_espejo]).
+
+    Por qué espejos + espera anti-barrido (medido con
+    scripts/probe_todus.py): el bucket público de toDus barre sin
+    aviso namespaces enteros (la raíz y users/tg_* en <2 min; dk/,
+    refugio durante días, amaneció vacío al día siguiente). Un solo
+    namespace fijo es cuestión de tiempo que caiga. Por eso:
+
+    1. Se sube a S3_MIRRORS namespaces candidatos (en el orden
+       aprendido: el último que sobrevivió, primero).
+    2. Se espera S3_SETTLE_SECONDS y se comprueba que siguen vivos
+       ANTES de entregar ningún enlace (el barrido rápido actúa en
+       <2 min, así que un enlace entregado ya superó esa ventana;
+       contra los barridos lentos — users/df/ murió a los 10-18 min —
+       el seguro es el espejo del punto 3, no la espera).
+    3. Se entregan TODOS los enlaces vivos (principal + espejo): si
+       un namespace cae mañana, el otro puede seguir funcionando.
+    4. El namespace que muere queda relegado al final para la
+       próxima subida (memoria en s3_namespace_state.json).
+
+    Solo si ningún namespace consigue dejar el archivo vivo se lanza
+    RuntimeError (mejor un error honesto que un ✓ con enlaces muertos).
+    """
+    actual_size = os.path.getsize(temp_path)
+    if size and size != actual_size:
+        log.warning(
+            f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
+        )
+    size = actual_size
+
+    mirrors = S3_MIRRORS if S3_UNSIGNED else 1
+    settle = S3_SETTLE_SECONDS if (S3_UNSIGNED and S3_VERIFY_UPLOAD) else 0
+    candidates = _ns_candidates()
+    tried = []
+    collected = []  # [(prefix, url)]
+    errors = []
+
+    async def _notify(step):
+        if status_cb:
+            try:
+                await status_cb(
+                    _render_status_progress(step, filename, size)
+                )
+            except Exception:
+                pass
+
+    async def _collect(prefixes):
+        got = []
+        for prefix in prefixes:
+            if len(collected) + len(got) >= mirrors:
+                break
+            tried.append(prefix)
+            key = build_s3_key(user_id, filename, prefix)
+            url = s3_public_url(key)
+            await _notify("uploading")
+            try:
+                await _upload_and_verify(temp_path, key, url, filename, size)
+            except _S3UploadExhausted as e:
+                errors.append(f"{prefix or 'raíz'}: {e}")
+                log.warning(f"S3: namespace '{prefix}' agotado: {e}")
+                await asyncio.to_thread(_ns_reorder, None, prefix)
+                continue
+            got.append((prefix, url))
+        return got
+
+    collected += await _collect(candidates)
+
+    # Espera anti-barrido (hasta 2 rondas si todo muere y quedan
+    # namespaces por probar).
+    for _round in range(2):
+        if not collected or settle <= 0:
+            break
+        await _notify("verifying")
+        log.info(
+            f"S3: esperando {settle}s para confirmar que sobrevive al "
+            f"barrido: {[u for _, u in collected]}"
+        )
+        await asyncio.sleep(settle)
+        survivors = []
+        for prefix, url in collected:
+            state, detail = await _verify_s3_object(url, size)
+            if state == "dead":
+                errors.append(
+                    f"{prefix or 'raíz'}: barrido tras {settle}s ({detail})"
+                )
+                log.warning(
+                    f"S3: el barrido eliminó {url} antes de entregarlo "
+                    f"({detail}); namespace relegado"
+                )
+                await asyncio.to_thread(_ns_reorder, None, prefix)
+            else:
+                survivors.append((prefix, url))
+        collected = survivors
+        if collected:
+            break
+        remaining = [x for x in candidates if x not in tried]
+        if not remaining:
+            break
+        collected += await _collect(remaining)
+
+    if not collected:
+        raise RuntimeError(
+            "No se pudo dejar el archivo activo en S3 en ningún "
+            f"namespace. Detalles: {'; '.join(errors[-3:]) or 'sin detalle'}. "
+            "El bucket puede estar barriendo todo ahora mismo; "
+            "reenvíalo en unos minutos."
+        )
+
+    winner = collected[0][0]
+    await asyncio.to_thread(_ns_reorder, winner, None)
+    urls = [u for _, u in collected]
+    log.info(f"S3 OK final: principal={urls[0]} espejos={urls[1:]}")
+    return urls[0], urls[1:]
 
 # ============== DOWNLOAD ==============
 async def _download_sequential(session, url, temp_path, total, job):
@@ -1090,6 +1335,92 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
         return None, str(e)[:200]
 
 
+# ============== UDYAT (descarga sin megas, solo Cuba) ==============
+# En Cuba, descargar de s3.todus.cu consume megas facturables, pero el
+# mismo MinIO responde en una IP interna (UDYAT_FREE_IP) que ETECSA no
+# factura. La receta del cliente (sistema UDYAT; formato documentado en
+# juanbas2005/todus-s3-api §15): conectar a la IP con las cabeceras
+# Host: s3.todus.cu y User-Agent: Wget/1.21.3, ignorando el certificado
+# self-signed. El bot no puede hacer eso por el usuario (depende de su
+# red y de su gestor), pero sí generarle el manifiesto .udyat listo
+# para importar en la app IroS3Dl:
+#   {"f": nombre, "s": tamaño, "md5": ..., "c": [{"url", "size"}],
+#    "h": IP gratuita, "original_host": "s3.todus.cu",
+#    "platform": "android"}
+# Se emite UN solo chunk con la URL principal, como el ejemplo
+# documentado: la semántica de una lista con varios chunks no está
+# documentada (¿partes? ¿alternativas?) y arriesgaría la descarga.
+
+def _udyat_supported():
+    """UDYAT solo tiene sentido contra el bucket público de toDus."""
+    return (
+        S3_UNSIGNED
+        and (urlparse(S3_ENDPOINT).hostname or "") == "s3.todus.cu"
+    )
+
+
+def _md5_file_sync(path):
+    """MD5 hex de un archivo en streaming (se llama vía to_thread)."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _udyat_free_url(public_url):
+    """Reescribe el host de la URL pública a la IP gratuita (UDYAT)."""
+    return urlparse(public_url)._replace(netloc=UDYAT_FREE_IP).geturl()
+
+
+def build_udyat_manifest(public_url, filename, size, md5_hex):
+    """Manifiesto .udyat (IroS3Dl) para descargar sin gastar megas."""
+    return {
+        "f": os.path.basename(filename or "archivo.bin"),
+        "s": size,
+        "md5": md5_hex,
+        "c": [{"url": _udyat_free_url(public_url), "size": size}],
+        "h": UDYAT_FREE_IP,
+        "original_host": urlparse(public_url).hostname or "s3.todus.cu",
+        "platform": "android",
+    }
+
+
+async def _maybe_send_udyat(job, chat_id, temp_path, filename, size, public_url):
+    """Si el usuario activó /udyat, le envía el manifiesto .udyat.
+
+    Nunca rompe el flujo principal: cualquier fallo aquí solo se loguea.
+    """
+    if not SEND_UDYAT_VIA_TG or job.user_id not in _udyat_users:
+        return
+    if not _udyat_supported():
+        return
+    try:
+        md5_hex = await asyncio.to_thread(_md5_file_sync, temp_path)
+        manifest = build_udyat_manifest(public_url, filename, size, md5_hex)
+        data = json.dumps(
+            manifest, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        stem = (
+            os.path.splitext(os.path.basename(filename or "archivo"))[0]
+            or "archivo"
+        )
+        payload = io.BytesIO(data)
+        payload.name = f"{stem}.udyat"
+        await _tg_client.send_file(
+            chat_id, file=payload,
+            caption=(
+                "🆓 Manifiesto UDYAT: impórtalo en IroS3Dl (mantén "
+                "presionado el botón ➕) para descargar SIN gastar "
+                "megas (solo desde Cuba)."
+            ),
+            force_document=True,
+        )
+        log.info(f"UDYAT enviado a {chat_id}: {payload.name}")
+    except Exception as e:
+        log.warning(f"No se pudo enviar el manifiesto UDYAT a {chat_id}: {e}")
+
+
 # ============== MAIN PROCESSOR ==============
 async def process_job(job):
     if job.kind == "tg_media":
@@ -1201,7 +1532,14 @@ async def _process_tg_media(job):
             _render_status_progress("uploading", filename, size)
         )
 
-        url_final = await subir_a_s3(temp_path, filename, size, user_id=job.user_id)
+        async def _s3_status(text):
+            await tg_edit_status(chat_id, status_msg, text)
+
+        url_final, _url_espejos = await subir_a_s3(
+            temp_path, filename, size, user_id=job.user_id,
+            status_cb=_s3_status,
+        )
+        url_espejo = _url_espejos[0] if _url_espejos else None
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
@@ -1216,16 +1554,17 @@ async def _process_tg_media(job):
             await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
-                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
                     source=source_label
                 )
             )
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
         caption = _render_result_card(
-            name=name, ext=ext_out, size=size, s3_url=url_final,
+            name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
             source=source_label
         )
         tipo, send_err = await _send_file_via_telegram(
@@ -1245,10 +1584,11 @@ async def _process_tg_media(job):
             await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
-                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
                     source=source_label
                 ) + f"\n\n{_render_error(err_msg)}"
             )
+        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
 
     except asyncio.CancelledError:
         try:
@@ -1367,7 +1707,14 @@ async def _process_url(job):
             _render_status_progress("uploading", filename, size)
         )
 
-        url_final = await subir_a_s3(temp_path, filename, size, user_id=job.user_id)
+        async def _s3_status(text):
+            await tg_edit_status(chat_id, status_msg, text)
+
+        url_final, _url_espejos = await subir_a_s3(
+            temp_path, filename, size, user_id=job.user_id,
+            status_cb=_s3_status,
+        )
+        url_espejo = _url_espejos[0] if _url_espejos else None
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
@@ -1382,16 +1729,17 @@ async def _process_url(job):
             await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
-                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
                     source="web"
                 )
             )
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
         caption = _render_result_card(
-            name=name, ext=ext_out, size=size, s3_url=url_final,
+            name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
             source="web"
         )
         tipo, send_err = await _send_file_via_telegram(
@@ -1409,10 +1757,11 @@ async def _process_url(job):
             await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
-                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
                     source="web"
                 ) + f"\n\n{_render_error(err_msg)}"
             )
+        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
 
     except asyncio.CancelledError:
         try:
@@ -1438,6 +1787,9 @@ async def _process_url(job):
 # Usuarios que han activado /sendfile (recibir el archivo además de la URL)
 # Por defecto el bot SOLO envía la URL (ahorra datos en toDus).
 _sendfile_users = set()
+# Usuarios que han activado /udyat (recibir el manifiesto .udyat para
+# descargar sin gastar megas vía IroS3Dl).
+_udyat_users = set()
 
 
 async def on_tg_message(event):
@@ -1504,6 +1856,21 @@ async def on_tg_message(event):
             else:
                 _sendfile_users.add(sender_id)
                 await event.respond(_render_sendfile_state(enabled=True))
+            return
+
+        if low in ("/udyat", "/sinmegas"):
+            if not SEND_UDYAT_VIA_TG or not _udyat_supported():
+                await event.respond(
+                    f"{ICON_ERROR} El manifiesto UDYAT no está disponible en este bot "
+                    "(solo aplica al S3 público de toDus)."
+                )
+                return
+            if sender_id in _udyat_users:
+                _udyat_users.discard(sender_id)
+                await event.respond(_render_udyat_state(enabled=False))
+            else:
+                _udyat_users.add(sender_id)
+                await event.respond(_render_udyat_state(enabled=True))
             return
 
         # ===== DETECCIÓN DE MEDIA REENVIADA =====

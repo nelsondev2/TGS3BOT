@@ -44,14 +44,22 @@ services:
         value: "stream"
       - key: S3_UNSIGNED
         value: "1"
-      - key: S3_KEY_PREFIX
-        # Namespace que SOBREVIVE en toDus (medido con scripts/probe_todus.py):
-        # el bucket barre en <2 min todo lo que no esté bajo users/df/, hi/ o dk/.
-        # Keys resultantes: users/df/<user_id>/<nombre>_<rand>.<ext>
-        # OJO: si tu servicio ya tenía "users" de la versión anterior, este
-        # valor lo sustituye al sincronizar el Blueprint (el código también
-        # mapea "users" -> "users/df" por compatibilidad).
-        value: "users/df"
+      - key: S3_KEY_PREFIXES
+        # Namespaces CANDIDATOS en orden (medido con scripts/probe_todus.py
+        # el 2026-10-27): hi/ es hoy el más sólido, users/df/ muere a los
+        # 10-18 min y dk/ cayó por completo. El bot sube a S3_MIRRORS de
+        # ellos (principal + espejo) y recuerda cuál sobrevive.
+        # Keys resultantes: <prefijo>/<user_id>/<nombre>_<rand>.<ext>
+        value: "hi,users/df,dk/tg_{user_id}"
+      - key: S3_MIRRORS
+        # A cuántos namespaces subir cada archivo (principal + espejos)
+        value: "2"
+      - key: S3_SETTLE_SECONDS
+        # Espera anti-barrido antes de entregar el enlace (segundos)
+        value: "150"
+      # NOTA: ya no se usa S3_KEY_PREFIX (singular). Si tu servicio lo
+      # tenía en "users" o "users/df", el código lo interpreta como
+      # "lista por defecto" por compatibilidad; puedes borrar la var.
       - key: S3_VERIFY_UPLOAD
         # "1" = comprobar con HEAD que el objeto existe antes de entregar el enlace
         value: "1"
@@ -74,6 +82,15 @@ services:
         # Por defecto "0" = solo URL S3 (ahorra datos en toDus)
         # "1" = reenviar archivo + URL S3
         value: "0"
+      - key: SEND_UDYAT_VIA_TG
+        # "1" = permite el manifiesto .udyat (descarga sin megas en Cuba
+        # vía IroS3Dl) a quien lo active con /udyat. Es un JSON de ~300 B,
+        # no gasta datos. "0" desactiva la función por completo.
+        value: "1"
+      - key: UDYAT_FREE_IP
+        # IP gratuita de toDus escrita en el manifiesto. Puede cambiar;
+        # respaldo conocido: 152.207.206.88
+        value: "152.207.206.86"
     disk:
       # Disco efímero para descargas temporales
       name: tmp-downloads
