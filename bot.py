@@ -37,6 +37,8 @@ import uuid
 import signal
 import asyncio
 import json
+import io
+import hashlib
 import logging
 import mimetypes
 import threading
@@ -197,6 +199,16 @@ ALWAYS_SHOW_S3_URL = os.environ.get("ALWAYS_SHOW_S3_URL", "1") == "1"
 # Cambiar a "1" para que por defecto SÍ se reenvíe el archivo.
 # Los usuarios pueden activar/desactivar con /sendfile.
 SEND_FILE_VIA_TG = os.environ.get("SEND_FILE_VIA_TG", "0") == "1"
+# Manifiesto .udyat para descargar "sin gastar megas" vía la IP gratuita
+# de toDus (sistema UDYAT / app IroS3Dl; solo desde la red de ETECSA en
+# Cuba). Es un JSON de ~300 B, así que el interruptor global va en "1"
+# (a diferencia de SEND_FILE_VIA_TG, aquí no hay riesgo de gastar datos):
+# solo lo recibe quien lo activa con /udyat, y solo si el S3 en uso es
+# s3.todus.cu. "0" desactiva la función por completo.
+SEND_UDYAT_VIA_TG = os.environ.get("SEND_UDYAT_VIA_TG", "1") == "1"
+# IP que ETECSA no factura para s3.todus.cu (puede cambiar; respaldo
+# conocido: 152.207.206.88).
+UDYAT_FREE_IP = os.environ.get("UDYAT_FREE_IP", "152.207.206.86").strip() or "152.207.206.86"
 
 # --- HTTP Headers ---
 BROWSER_HEADERS = {
@@ -533,11 +545,13 @@ def _render_help(is_userbot=False):
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
         "Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.",
+        "Para descargar sin gastar megas (solo Cuba): activa /udyat y te envío el manifiesto para la app IroS3Dl. Con 1DM+: cambia el host del enlace por 152.207.206.86 y añade las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`.",
         "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
+        "  /udyat — toggle: manifiesto .udyat (descargar sin megas en Cuba)",
     ]
     if is_userbot:
         lines.extend([
@@ -553,6 +567,20 @@ def _render_sendfile_state(enabled):
         return f"{ICON_DONE} Modo archivo activado\n\nA partir de ahora recibirás el archivo además de la URL."
     else:
         return f"{ICON_DONE} Modo archivo desactivado\n\nSolo recibirás la URL S3 (ahorra datos en toDus)."
+
+
+def _render_udyat_state(enabled):
+    if enabled:
+        return (
+            f"{ICON_DONE} Manifiesto UDYAT activado\n\n"
+            "Tras cada subida te enviaré también el archivo .udyat para "
+            "descargar SIN gastar megas: impórtalo en la app IroS3Dl "
+            "(mantén presionado el botón ➕ en Descargas). "
+            "Solo funciona desde la red de ETECSA en Cuba; prueba con un "
+            "archivo pequeño y revisa tu saldo la primera vez."
+        )
+    else:
+        return f"{ICON_DONE} Manifiesto UDYAT desactivado\n\nSolo recibirás la URL S3."
 
 
 def _render_unauthorized():
@@ -1307,6 +1335,92 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
         return None, str(e)[:200]
 
 
+# ============== UDYAT (descarga sin megas, solo Cuba) ==============
+# En Cuba, descargar de s3.todus.cu consume megas facturables, pero el
+# mismo MinIO responde en una IP interna (UDYAT_FREE_IP) que ETECSA no
+# factura. La receta del cliente (sistema UDYAT; formato documentado en
+# juanbas2005/todus-s3-api §15): conectar a la IP con las cabeceras
+# Host: s3.todus.cu y User-Agent: Wget/1.21.3, ignorando el certificado
+# self-signed. El bot no puede hacer eso por el usuario (depende de su
+# red y de su gestor), pero sí generarle el manifiesto .udyat listo
+# para importar en la app IroS3Dl:
+#   {"f": nombre, "s": tamaño, "md5": ..., "c": [{"url", "size"}],
+#    "h": IP gratuita, "original_host": "s3.todus.cu",
+#    "platform": "android"}
+# Se emite UN solo chunk con la URL principal, como el ejemplo
+# documentado: la semántica de una lista con varios chunks no está
+# documentada (¿partes? ¿alternativas?) y arriesgaría la descarga.
+
+def _udyat_supported():
+    """UDYAT solo tiene sentido contra el bucket público de toDus."""
+    return (
+        S3_UNSIGNED
+        and (urlparse(S3_ENDPOINT).hostname or "") == "s3.todus.cu"
+    )
+
+
+def _md5_file_sync(path):
+    """MD5 hex de un archivo en streaming (se llama vía to_thread)."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _udyat_free_url(public_url):
+    """Reescribe el host de la URL pública a la IP gratuita (UDYAT)."""
+    return urlparse(public_url)._replace(netloc=UDYAT_FREE_IP).geturl()
+
+
+def build_udyat_manifest(public_url, filename, size, md5_hex):
+    """Manifiesto .udyat (IroS3Dl) para descargar sin gastar megas."""
+    return {
+        "f": os.path.basename(filename or "archivo.bin"),
+        "s": size,
+        "md5": md5_hex,
+        "c": [{"url": _udyat_free_url(public_url), "size": size}],
+        "h": UDYAT_FREE_IP,
+        "original_host": urlparse(public_url).hostname or "s3.todus.cu",
+        "platform": "android",
+    }
+
+
+async def _maybe_send_udyat(job, chat_id, temp_path, filename, size, public_url):
+    """Si el usuario activó /udyat, le envía el manifiesto .udyat.
+
+    Nunca rompe el flujo principal: cualquier fallo aquí solo se loguea.
+    """
+    if not SEND_UDYAT_VIA_TG or job.user_id not in _udyat_users:
+        return
+    if not _udyat_supported():
+        return
+    try:
+        md5_hex = await asyncio.to_thread(_md5_file_sync, temp_path)
+        manifest = build_udyat_manifest(public_url, filename, size, md5_hex)
+        data = json.dumps(
+            manifest, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        stem = (
+            os.path.splitext(os.path.basename(filename or "archivo"))[0]
+            or "archivo"
+        )
+        payload = io.BytesIO(data)
+        payload.name = f"{stem}.udyat"
+        await _tg_client.send_file(
+            chat_id, file=payload,
+            caption=(
+                "🆓 Manifiesto UDYAT: impórtalo en IroS3Dl (mantén "
+                "presionado el botón ➕) para descargar SIN gastar "
+                "megas (solo desde Cuba)."
+            ),
+            force_document=True,
+        )
+        log.info(f"UDYAT enviado a {chat_id}: {payload.name}")
+    except Exception as e:
+        log.warning(f"No se pudo enviar el manifiesto UDYAT a {chat_id}: {e}")
+
+
 # ============== MAIN PROCESSOR ==============
 async def process_job(job):
     if job.kind == "tg_media":
@@ -1445,6 +1559,7 @@ async def _process_tg_media(job):
                 )
             )
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
@@ -1473,6 +1588,7 @@ async def _process_tg_media(job):
                     source=source_label
                 ) + f"\n\n{_render_error(err_msg)}"
             )
+        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
 
     except asyncio.CancelledError:
         try:
@@ -1618,6 +1734,7 @@ async def _process_url(job):
                 )
             )
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
+            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
@@ -1644,6 +1761,7 @@ async def _process_url(job):
                     source="web"
                 ) + f"\n\n{_render_error(err_msg)}"
             )
+        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
 
     except asyncio.CancelledError:
         try:
@@ -1669,6 +1787,9 @@ async def _process_url(job):
 # Usuarios que han activado /sendfile (recibir el archivo además de la URL)
 # Por defecto el bot SOLO envía la URL (ahorra datos en toDus).
 _sendfile_users = set()
+# Usuarios que han activado /udyat (recibir el manifiesto .udyat para
+# descargar sin gastar megas vía IroS3Dl).
+_udyat_users = set()
 
 
 async def on_tg_message(event):
@@ -1735,6 +1856,21 @@ async def on_tg_message(event):
             else:
                 _sendfile_users.add(sender_id)
                 await event.respond(_render_sendfile_state(enabled=True))
+            return
+
+        if low in ("/udyat", "/sinmegas"):
+            if not SEND_UDYAT_VIA_TG or not _udyat_supported():
+                await event.respond(
+                    f"{ICON_ERROR} El manifiesto UDYAT no está disponible en este bot "
+                    "(solo aplica al S3 público de toDus)."
+                )
+                return
+            if sender_id in _udyat_users:
+                _udyat_users.discard(sender_id)
+                await event.respond(_render_udyat_state(enabled=False))
+            else:
+                _udyat_users.add(sender_id)
+                await event.respond(_render_udyat_state(enabled=True))
             return
 
         # ===== DETECCIÓN DE MEDIA REENVIADA =====

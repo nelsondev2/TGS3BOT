@@ -11,6 +11,7 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 - ✅ **Event loop no bloqueado**: llamadas síncronas envueltas en `asyncio.to_thread`
 - ✅ **Subida a toDus resistente al barrido**: PUT directo en una sola petición (sin multipart de boto3) y espejos en varios namespaces. Medido en vivo con `scripts/probe_todus.py` (26-27 oct): el bucket barre namespaces enteros sin aviso (la raíz y `users/tg_*` en <2 min; `dk/` cayó de un día para otro; `users/df/` pasó a morir a los 10-18 min; `hi/` es hoy el refugio más sólido) — eso era lo que hacía que los enlaces vencieran casi al instante
 - ✅ **Verificación + espera anti-barrido + memoria**: el enlace se entrega solo tras comprobar con HEAD (antes y después de una espera de 150 s) que el objeto sigue vivo; si desaparece, cae automáticamente al siguiente namespace y recuerda cuál sobrevivió. Se entrega **enlace principal + espejo** en otro namespace; nunca se entrega un enlace muerto como ✓
+- 🆓 **Descarga sin megas (Cuba)**: con `/udyat` el bot envía además un manifiesto `.udyat` para la app IroS3Dl que apunta a la IP gratuita de toDus (`152.207.206.86`); la ayuda del bot trae también la receta manual para 1DM+ (cabeceras UDYAT)
 - ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
 - ✅ **Limpieza de archivos `.part`** en cancelación o fallo
@@ -137,6 +138,8 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `PARALLEL_URL_PARTS` | `4` | Partes paralelas |
 | `ALWAYS_SHOW_S3_URL` | `1` | Mostrar URL S3 siempre |
 | `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). Cambiar a `1` para reenviar archivo. Los usuarios pueden opt-in con `/sendfile` |
+| `SEND_UDYAT_VIA_TG` | `1` | Permite enviar el manifiesto `.udyat` (descarga sin megas en Cuba) a quien lo active con `/udyat`. Solo aplica si el S3 es `s3.todus.cu`. `0` desactiva la función |
+| `UDYAT_FREE_IP` | `152.207.206.86` | IP gratuita de toDus escrita en el manifiesto `.udyat` (respaldo conocido: `152.207.206.88`) |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `S3_ENDPOINT` | `https://s3.todus.cu` | Endpoint S3 |
 | `S3_BUCKET` | `stream` | Bucket S3 |
@@ -162,6 +165,7 @@ Ver `.env.example` para referencia.
 | `/cancel`, `cancelar` | Cancela tu trabajo activo |
 | `/status` | Verifica si tienes trabajo en curso |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
+| `/udyat` (alias `/sinmegas`) | Toggle: recibir también el manifiesto `.udyat` para descargar sin gastar megas en Cuba (IroS3Dl) — por defecto OFF |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
@@ -175,6 +179,15 @@ Por defecto el bot **SOLO envía la URL S3 como texto**, no reenvía el archivo.
 Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo ahorro, escribe `/sendfile` otra vez.
 
 Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`.
+
+### Descargar sin gastar megas (UDYAT, solo Cuba)
+
+El servidor `s3.todus.cu` responde también en una **IP interna que ETECSA no factura** (`152.207.206.86`), siempre que el cliente conecte a esa IP con las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3` e ignore el certificado self-signed (sistema UDYAT, documentado en el repo `juanbas2005/todus-s3-api`). El bot no puede hacer eso por el usuario, pero sí prepararle todo:
+
+- **IroS3Dl (automático):** activa `/udyat` en el bot y, tras cada subida, recibirás un archivo `<nombre>.udyat` (JSON de ~300 B con nombre, tamaño, MD5 y la URL ya reescrita a la IP gratuita). Descárgalo e impórtalo en IroS3Dl (mantén presionado el botón ➕ en la pantalla de descargas) y la app bajará el archivo sin consumir megas.
+- **1DM+ (manual):** 1DM+ admite cabeceras personalizadas por descarga. Añade una descarga con el enlace del bot **cambiando el host** por la IP: `https://152.207.206.86/stream/...`, y en las cabeceras (headers) de esa descarga pon `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`. Si la app avisa del certificado (esa IP usa uno self-signed), acéptalo para continuar.
+
+> ⚠️ Esto solo funciona desde la red cubana de ETECSA. Verifica la primera vez con un archivo pequeño y comprueba el saldo antes/después: que salga a 0 MB depende de cómo ETECSA clasifique esa IP, y la IP puede cambiar (ajústala con `UDYAT_FREE_IP`; respaldo conocido: `152.207.206.88`).
 
 ## 🎨 Interfaz minimalista
 

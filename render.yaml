@@ -82,6 +82,15 @@ services:
         # Por defecto "0" = solo URL S3 (ahorra datos en toDus)
         # "1" = reenviar archivo + URL S3
         value: "0"
+      - key: SEND_UDYAT_VIA_TG
+        # "1" = permite el manifiesto .udyat (descarga sin megas en Cuba
+        # vía IroS3Dl) a quien lo active con /udyat. Es un JSON de ~300 B,
+        # no gasta datos. "0" desactiva la función por completo.
+        value: "1"
+      - key: UDYAT_FREE_IP
+        # IP gratuita de toDus escrita en el manifiesto. Puede cambiar;
+        # respaldo conocido: 152.207.206.88
+        value: "152.207.206.86"
     disk:
       # Disco efímero para descargas temporales
       name: tmp-downloads
