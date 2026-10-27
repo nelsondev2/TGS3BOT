@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+.env
+s3_namespace_state.json
