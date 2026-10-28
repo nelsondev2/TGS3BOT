@@ -12,7 +12,7 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 - ✅ **Subida a toDus resistente al barrido**: PUT directo en una sola petición (sin multipart de boto3) y espejos en varios namespaces. Medido en vivo con `scripts/probe_todus.py` (26-27 oct): el bucket barre namespaces enteros sin aviso (la raíz y `users/tg_*` en <2 min; `dk/` cayó de un día para otro; `users/df/` pasó a morir a los 10-18 min; `hi/` es hoy el refugio más sólido) — eso era lo que hacía que los enlaces vencieran casi al instante
 - ✅ **Verificación + guardián anti-barrido + memoria**: el objeto se comprueba con HEAD al subir y el enlace se entrega **al instante** (principal + espejo, subidos en paralelo); un guardián en segundo plano espera 150 s, re-verifica las copias y, si el barrido borró alguna, **edita tu mensaje** con el enlace bueno (o marca el error). La memoria recuerda qué namespace sobrevive; con `S3_DELIVER_FAST=0` se vuelve a la espera bloqueante previa
 - 📲 **Subida OFICIAL a toDus (ToDus-SDK)**: con una cuenta de toDus (login desde el propio bot con `/toduslogin` por SMS), cada subida se **reserva** en el servidor (`todus:purl`, como la app oficial) y el objeto queda registrado fuera del barrido de anónimos. Si la vía oficial falla, cae sola a la anónima adaptativa. Es la respuesta a que hasta `hi/` acabara venciendo
-- 📋 **Varios archivos seguidos, sin rechazos**: reenvía los que quieras — se encolan y se suben **uno a uno**, cada uno en **un solo mensaje** que se edita con el % en vivo (`Recibiendo 45%` → `Subiendo 78%`) hasta convertirse en la tarjeta con el enlace. Al terminar un lote de ≥2 recibes un `enlaces.txt` con todas las URLs (una por línea), listo para importar en **IDM/1DM+** (Android)
+- 📋 **Varios archivos seguidos, sin rechazos**: reenvía los que quieras — se encolan y se suben **uno a uno**, cada uno en **un solo mensaje** que se edita con el % en vivo (`Recibiendo 45%` → `Subiendo 78%`) hasta convertirse en la tarjeta con el enlace. Al terminar un lote de ≥2 recibes un `enlaces.txt` con todas las URLs (una por línea, cada una con su nombre original vía `#filename=` para que se descargue con ese nombre exacto), listo para importar en **IDM/1DM+** (Android; si su explorador no lo ve en Android 11+, es el *scoped storage*: guárdalo en Descargas y usa el icono de la mano = selector del sistema)
 - ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
 - ✅ **Limpieza de archivos `.part`** en cancelación o fallo
@@ -177,7 +177,7 @@ Ver `.env.example` para referencia.
 | `/toduslogout` | *(solo admin)* Cierra la sesión de toDus (vuelve a la vía anónima) |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
 | `<URL>` | Procesa cualquier URL http/https |
-| `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3. Puedes reenviar **varios seguidos**: suben en cola, uno a uno, y al final recibes un `enlaces.txt` con todos los enlaces para IDM/1DM+ |
+| `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3. Puedes reenviar **varios seguidos**: suben en cola, uno a uno, y al final recibes un `enlaces.txt` con todos los enlaces (y el nombre original de cada archivo) para IDM/1DM+ |
 
 ### Comportamiento por defecto (ahorra datos)
 
@@ -381,6 +381,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 16. El fix de namespace fijo (`users/df/`) dejó de bastar en 24 h: toDus cambió el barrido y `users/df/` pasó a morir a los 10-18 min (y `dk/`, refugio el día anterior, a <2 min) → subida adaptativa: candidatos `S3_KEY_PREFIXES` con `hi/` primero, espejo en 2 namespaces, espera anti-barrido de 150 s antes de entregar y memoria persistente del namespace que sobrevive
 17. Ni la subida adaptativa bastó a la larga: el barrido rotó otra vez, tumbó también `hi/` y los enlaces volvieron a vencer → **vía oficial con ToDus-SDK**: reserva `todus:purl` con cuenta propia (login por SMS desde el bot con `/toduslogin`, solo admin), PUT a la URL que asigna el servidor, JWT auto-renovable y caída automática a la vía anónima si algo falla
 18. Reenviar varios archivos seguidos solo subía el primero («ya tienes un trabajo en curso» para el resto, y se perdían) y el «Subiendo» parecía colgado durante minutos: espejos secuenciales + espera anti-barrido bloqueante de 150 s + ninguna señal de progreso (y editar con el mismo texto creaba mensajes huérfanos) → **cola FIFO por usuario** con lote `enlaces.txt` para IDM/1DM+, espejos **en paralelo**, **% en vivo** en un único mensaje editado hasta entregar el enlace y guardián anti-barrido en segundo plano. Se elimina de paso toda la función UDYAT/`.udyat` (interfaz limpia)
+19. El `enlaces.txt` del lote no aparecía en el explorador de 1DM+ y las descargas salían con el nombre de la key (`<stem>_<uuid8>`): lo primero es el *scoped storage* de Android 11+ (el explorador interno de 1DM+ no ve archivos de otras apps; su propio FAQ indica usar el icono de la mano —selector del sistema— tras guardar el .txt en Descargas; el caption ahora trae los pasos exactos y el plan B del portapapeles) y lo segundo se arregla con el truco que 1DM+ documenta en su changelog 15.4: cada línea lleva `#filename=<nombre original>` al final de la URL (el fragmento no viaja al servidor; si el gestor lo ignora, manda el `Content-Disposition` de siempre)
 
 ## 🆘 Troubleshooting
 
@@ -399,6 +400,12 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 **¿Y los repos de referencia?** `miguelorlandos06/s3_bot` sube a la raíz del bucket (`<uuid>_<nombre>`) sin verificar: sobre el barrido actual es el patrón que muere en <2 min, así que no es un modelo a seguir para esto. `nyxthor-dev/toDus-SDK` implementa el protocolo oficial de toDus y revela el mecanismo "correcto": la app reserva la subida por XMPP (`todus:purl`, con flag `persistent`) y el servidor asigna la URL — esos objetos quedan registrados y no dependen de adivinar namespaces. Es la vía con garantías a futuro, pero requiere una **cuenta de toDus** (número + contraseña) dedicada al bot. (El SDK también documenta `login_with_phone_only`, un bypass de autenticación del servidor: no se usa aquí.)
 
 **Si aun así un enlace cae con el tiempo:** el bucket de toDus es público y anónimo hasta para borrar — toDus o terceros pueden purgarlo sin aviso y eso no lo puede evitar ningún cliente anónimo. Descarga los archivos pronto o usa tu propio S3 (`S3_UNSIGNED=0` + tus claves) para enlaces permanentes.
+
+### 1DM+/IDM no encuentra el `enlaces.txt` al importar
+
+Es el *scoped storage* de Android 11+: el explorador interno de 1DM+ no puede ver archivos guardados por otras apps (Telegram). Solución (la del propio FAQ de 1DM+): guarda el `.txt` en la carpeta **Descargas**, ve a importar y, si no aparece, toca el **icono de la mano** en la barra de su explorador para abrir el **selector de archivos del sistema** y elígelo ahí. Alternativa sin archivos: abre el `.txt`, copia todo el contenido y usa «Importar desde el portapapeles».
+
+Además, cada enlace del `.txt` lleva `#filename=<nombre>` al final: 1DM+ lo usa para guardar la descarga con el **nombre original exacto** (no el de la key de S3). El fragmento no se envía al servidor, así que la descarga es la misma de siempre.
 
 ### `FloodWaitError: A wait of N seconds is required`
 
