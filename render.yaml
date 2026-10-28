@@ -57,6 +57,12 @@ services:
       - key: S3_SETTLE_SECONDS
         # Espera anti-barrido antes de entregar el enlace (segundos)
         value: "150"
+      - key: S3_DELIVER_FAST
+        # "1" = entregar el enlace en cuanto pasa la 1ª verificación;
+        # un guardián vigila el settle en segundo plano y edita el
+        # mensaje si el barrido borra alguna copia. "0" = esperar todo
+        # el settle antes de entregar nada (clásico, más lento).
+        value: "1"
       # NOTA: ya no se usa S3_KEY_PREFIX (singular). Si tu servicio lo
       # tenía en "users" o "users/df", el código lo interpreta como
       # "lista por defecto" por compatibilidad; puedes borrar la var.
@@ -82,15 +88,6 @@ services:
         # Por defecto "0" = solo URL S3 (ahorra datos en toDus)
         # "1" = reenviar archivo + URL S3
         value: "0"
-      - key: SEND_UDYAT_VIA_TG
-        # "1" = permite el manifiesto .udyat (descarga sin megas en Cuba
-        # vía IroS3Dl) a quien lo active con /udyat. Es un JSON de ~300 B,
-        # no gasta datos. "0" desactiva la función por completo.
-        value: "1"
-      - key: UDYAT_FREE_IP
-        # IP gratuita de toDus escrita en el manifiesto. Puede cambiar;
-        # respaldo conocido: 152.207.206.88
-        value: "152.207.206.86"
       # === ToDus oficial (ToDus-SDK) ===
       # La vía anónima depende de namespaces que el barrido de toDus va
       # tumbando sin aviso. La OFICIAL reserva cada subida con una

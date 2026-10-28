@@ -38,7 +38,6 @@ import signal
 import asyncio
 import json
 import io
-import hashlib
 import logging
 import mimetypes
 import threading
@@ -169,6 +168,14 @@ S3_MIRRORS = max(1, int(os.environ.get("S3_MIRRORS", "2") or "2"))
 # ninguna espera razonable caza: contra esos protege el ESPEJO en otro
 # namespace, no el settle. 0 = desactivada.
 S3_SETTLE_SECONDS = int(os.environ.get("S3_SETTLE_SECONDS", "150") or "0")
+# Entrega inmediata (default): el enlace se devuelve en cuanto la
+# primera verificación pasa, y la espera anti-barrido la vigila un
+# guardián en segundo plano que EDITA el mensaje si el servidor borra
+# alguna copia (intercambia principal/espejo o marca el error). Sin
+# esto, "Subiendo/Verificando" parecía colgado durante minutos.
+# "0" = modo clásico: esperar todo el settle ANTES de entregar ningún
+# enlace (más lento, máxima garantía previa).
+S3_DELIVER_FAST = os.environ.get("S3_DELIVER_FAST", "1") == "1"
 
 # --- Servidor ---
 PORT = int(os.environ.get("PORT", "10000"))
@@ -199,16 +206,6 @@ ALWAYS_SHOW_S3_URL = os.environ.get("ALWAYS_SHOW_S3_URL", "1") == "1"
 # Cambiar a "1" para que por defecto SÍ se reenvíe el archivo.
 # Los usuarios pueden activar/desactivar con /sendfile.
 SEND_FILE_VIA_TG = os.environ.get("SEND_FILE_VIA_TG", "0") == "1"
-# Manifiesto .udyat para descargar "sin gastar megas" vía la IP gratuita
-# de toDus (sistema UDYAT / app IroS3Dl; solo desde la red de ETECSA en
-# Cuba). Es un JSON de ~300 B, así que el interruptor global va en "1"
-# (a diferencia de SEND_FILE_VIA_TG, aquí no hay riesgo de gastar datos):
-# solo lo recibe quien lo activa con /udyat, y solo si el S3 en uso es
-# s3.todus.cu. "0" desactiva la función por completo.
-SEND_UDYAT_VIA_TG = os.environ.get("SEND_UDYAT_VIA_TG", "1") == "1"
-# IP que ETECSA no factura para s3.todus.cu (puede cambiar; respaldo
-# conocido: 152.207.206.88).
-UDYAT_FREE_IP = os.environ.get("UDYAT_FREE_IP", "152.207.206.86").strip() or "152.207.206.86"
 
 # --- ToDus oficial (ToDus-SDK) ---
 # La vía anónima depende de que el barrido respete algún namespace, y
@@ -343,6 +340,7 @@ class QueuedJob:
         "job_id", "user_id", "kind", "url", "original_name",
         "task", "created_at", "cancel_requested", "temp_paths",
         "status_msg", "chat_id", "message",
+        "result_url", "result_name",
     )
 
     def __init__(self, user_id, kind, url=None, original_name=None,
@@ -359,41 +357,120 @@ class QueuedJob:
         self.status_msg = status_msg  # mensaje de estado a editar
         self.chat_id = chat_id
         self.message = message  # mensaje original de Telegram (para media)
+        # Los rellena el procesador al entregar: alimentan el lote .txt
+        # y el guardián anti-barrido puede actualizar result_url.
+        self.result_url = None
+        self.result_name = None
 
 
-class SimpleLock:
+class UserJobQueue:
+    """Cola FIFO por usuario: los archivos se suben UNO A UNO.
+
+    Antes, reenviar varios archivos seguidos devolvía "ya tienes un
+    trabajo en curso" para todos menos el primero (y se perdían).
+    Ahora se encolan sin rechazar ninguno; cuando la cola se vacía, si
+    el lote tuvo >= 2 éxitos se envía un enlaces.txt con todas las
+    URLs (una por línea: el formato de importación de IDM/1DM+).
+    """
+
     def __init__(self):
-        self.active = {}
         self._lock = asyncio.Lock()
+        self._queues = {}      # user_id -> Queue[(job, factory)]
+        self._workers = {}     # user_id -> Task del worker
+        self._active = {}      # user_id -> job en curso
+        self._batch = {}       # user_id -> [(nombre, url)] del lote
+        self._batch_chat = {}  # user_id -> chat_id del lote
 
     def has_user_job(self, user_id):
-        return user_id in self.active
+        q = self._queues.get(user_id)
+        return (user_id in self._active
+                or (q is not None and not q.empty()))
 
-    async def run(self, job, coro_factory):
+    def pending_count(self, user_id):
+        q = self._queues.get(user_id)
+        return q.qsize() if q is not None else 0
+
+    def position_hint(self, user_id):
+        """Trabajos por delante de uno que llegue ahora (0 = empieza ya)."""
+        return (1 if user_id in self._active else 0) \
+            + self.pending_count(user_id)
+
+    async def enqueue(self, job, coro_factory):
         async with self._lock:
-            if job.user_id in self.active:
-                raise ValueError("user_already_running")
-            self.active[job.user_id] = job
+            q = self._queues.setdefault(job.user_id, asyncio.Queue())
+            q.put_nowait((job, coro_factory))
+            worker = self._workers.get(job.user_id)
+            if worker is None or worker.done():
+                self._workers[job.user_id] = asyncio.create_task(
+                    self._worker(job.user_id))
+
+    async def _worker(self, user_id):
+        q = self._queues[user_id]
         try:
-            coro = coro_factory()
-            job.task = asyncio.create_task(coro)
-            await job.task
+            while True:
+                job, factory = await q.get()
+                self._active[user_id] = job
+                if job.chat_id is not None:
+                    self._batch_chat[user_id] = job.chat_id
+                job.task = asyncio.create_task(factory())
+                cancelled = False
+                try:
+                    await job.task
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    log.exception("job error")
+                finally:
+                    self._active.pop(user_id, None)
+                if cancelled:
+                    # /cancel: también se descarta lo pendiente y el lote
+                    self._discard_pending(q)
+                    self._batch.pop(user_id, None)
+                    break
+                if job.result_url:
+                    self._batch.setdefault(user_id, []).append(
+                        (job.result_name or "archivo", job.result_url))
+                if q.empty():
+                    await self._flush_batch(user_id)
         finally:
-            async with self._lock:
-                self.active.pop(job.user_id, None)
+            self._workers.pop(user_id, None)
+
+    @staticmethod
+    def _discard_pending(q):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _flush_batch(self, user_id):
+        results = self._batch.pop(user_id, [])
+        chat_id = self._batch_chat.pop(user_id, None)
+        if len(results) < 2 or chat_id is None:
+            return
+        try:
+            await _send_links_txt(chat_id, results)
+        except Exception as e:
+            log.warning(f"No se pudo enviar el .txt de enlaces: {e}")
 
     async def cancel_user(self, user_id):
-        async with self._lock:
-            job = self.active.get(user_id)
-            if job is None:
-                return "none"
+        job = self._active.get(user_id)
+        if job is None and self.pending_count(user_id) == 0:
+            return "none"
+        if job is not None:
             job.cancel_requested = True
             if job.task and not job.task.done():
                 job.task.cancel()
-            return "active"
+            # El worker, al ver el cancel, vacía la cola y descarta el lote.
+        else:
+            q = self._queues.get(user_id)
+            if q is not None:
+                self._discard_pending(q)
+            self._batch.pop(user_id, None)
+        return "active"
 
 
-job_queue = SimpleLock()
+job_queue = UserJobQueue()
 
 
 # ============== UTILS ==============
@@ -501,7 +578,7 @@ ICON_CLOUD = "☁"
 
 def _render_result_card(name, ext, size, s3_url, kind="archivo",
                          source=None, send_file=False, sent_as=None,
-                         mirror_url=None):
+                         mirror_url=None, note=None):
     """Genera la tarjeta final del resultado.
 
     Formato limpio y profesional:
@@ -536,19 +613,24 @@ def _render_result_card(name, ext, size, s3_url, kind="archivo",
         # Segundo enlace al mismo archivo en otro namespace: si toDus
         # tumba un namespace entero, el espejo puede seguir vivo.
         lines.append(f"{ICON_LINK} {mirror_url} (espejo)")
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
-def _render_status_progress(step, filename=None, size=None):
+def _render_status_progress(step, filename=None, size=None, pct=None):
     """Estado de progreso minimalista.
 
     step: 'downloading' | 'uploading' | 'receiving' | 'verifying'
+    pct (0-100): si viene, se muestra tras el verbo ("Subiendo 45%").
     """
     icons = {"downloading": f"{ICON_PROCESSING} Descargando",
              "uploading": f"{ICON_PROCESSING} Subiendo",
              "receiving": f"{ICON_PROCESSING} Recibiendo",
              "verifying": f"{ICON_PROCESSING} Verificando enlace"}
     base = icons.get(step, f"{ICON_PROCESSING} Procesando")
+    if pct is not None:
+        base = f"{base} {pct}%"
     parts = [base]
     if filename:
         parts.append(filename)
@@ -579,13 +661,12 @@ def _render_help(is_userbot=False, is_admin=False):
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
         "Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.",
-        "Para descargar sin gastar megas (solo Cuba): activa /udyat y te envío el manifiesto para la app IroS3Dl. Con 1DM+: cambia el host del enlace por 152.207.206.86 y añade las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`.",
+        "Puedes reenviar **varios archivos seguidos**: se suben en cola, uno a uno, y al terminar te envío un `enlaces.txt` con todos los enlaces (uno por línea, listo para importar en IDM/1DM+).",
         "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
-        "  /udyat — toggle: manifiesto .udyat (descargar sin megas en Cuba)",
     ]
     if is_userbot:
         lines.extend([
@@ -650,34 +731,12 @@ def _render_todus_status():
     return "\n".join(lines)
 
 
-def _render_udyat_state(enabled):
-    if enabled:
-        return (
-            f"{ICON_DONE} Manifiesto UDYAT activado\n\n"
-            "Tras cada subida te enviaré también el archivo .udyat para "
-            "descargar SIN gastar megas: impórtalo en la app IroS3Dl "
-            "(mantén presionado el botón ➕ en Descargas). "
-            "Solo funciona desde la red de ETECSA en Cuba; prueba con un "
-            "archivo pequeño y revisa tu saldo la primera vez."
-        )
-    else:
-        return f"{ICON_DONE} Manifiesto UDYAT desactivado\n\nSolo recibirás la URL S3."
-
-
 def _render_unauthorized():
     return f"{ICON_ERROR} No estás autorizado para usar este bot."
 
 
-def _render_busy():
-    return f"{ICON_PROCESSING} Ya tienes un trabajo en curso. Usa /cancel para detenerlo."
-
-
 def _render_no_active_job():
     return "No tienes trabajos activos."
-
-
-def _render_active_job():
-    return f"{ICON_PROCESSING} Tienes un trabajo en curso."
 
 
 def _render_no_url():
@@ -708,7 +767,13 @@ async def tg_send_status(chat_id, text):
 
 
 async def tg_edit_status(chat_id, msg, text):
-    """Edita un mensaje existente. Si falla, envía uno nuevo."""
+    """Edita un mensaje existente; si ya no existe, envía uno nuevo.
+
+    Ojo: editar con el MISMO texto (MessageNotModifiedError) o durante
+    un FloodWait NO debe crear un mensaje nuevo: quedaría huérfano en
+    el chat mientras las siguientes ediciones van al mensaje viejo
+    (interfaz sucia: varios "Subiendo…" sueltos).
+    """
     global _tg_client
     if msg is None:
         return await tg_send_status(chat_id, text)
@@ -716,8 +781,84 @@ async def tg_edit_status(chat_id, msg, text):
         await _tg_client.edit_message(chat_id, msg, text)
         return msg
     except Exception as e:
+        if type(e).__name__ in ("MessageNotModifiedError", "FloodWaitError"):
+            return msg
         log.warning(f"tg_edit_status falló: {e}, enviando nuevo")
         return await tg_send_status(chat_id, text)
+
+
+async def tg_edit_quiet(chat_id, msg, text):
+    """Edición para el progreso (%): si falla, se ignora en silencio.
+
+    El progreso se actualiza cada pocos segundos; crear un mensaje
+    nuevo ante cualquier fallo transitorio inundaría el chat.
+    """
+    if msg is None:
+        return None
+    try:
+        await _tg_client.edit_message(chat_id, msg, text)
+    except Exception:
+        pass
+    return msg
+
+
+class _ThrottledProgress:
+    """Convierte (hecho, total) en emisiones de % sin spamear a Telegram.
+
+    Se emite como mucho cada `min_interval` segundos y solo cuando el
+    % cambia (al 100% se emite siempre). `emit` es async fn(pct).
+    """
+
+    def __init__(self, emit, min_interval=2.0):
+        self._emit = emit
+        self._min_interval = min_interval
+        # -inf: el primer % siempre se emite (monotonic() puede valer
+        # muy poco justo tras arrancar el contenedor).
+        self._last_ts = float("-inf")
+        self._last_pct = -1
+
+    async def report(self, done, total):
+        if not total or total <= 0:
+            return
+        pct = max(0, min(100, int(done * 100 / total)))
+        if pct == self._last_pct:
+            return
+        now = time.monotonic()
+        if pct < 100 and now - self._last_ts < self._min_interval:
+            return
+        self._last_ts = now
+        self._last_pct = pct
+        try:
+            await self._emit(pct)
+        except Exception:
+            pass
+
+
+def _start_put_progress(f, size, progress_cb):
+    """Tarea que reporta el % de un PUT sondeando la posición del file.
+
+    Se sondea `f.tell()` en vez de envolver el archivo: el cuerpo que
+    ve aiohttp sigue siendo el file REAL, así fija el Content-Length
+    por fstat y no usa chunked (que toDus no acepta en un PUT).
+    `progress_cb` es async fn(done, total). Devuelve la tarea o None;
+    quien llama la cancela al terminar el PUT.
+    """
+    if progress_cb is None or not size:
+        return None
+
+    async def _poll():
+        while True:
+            await asyncio.sleep(1.5)
+            try:
+                done = f.tell()
+            except Exception:
+                return
+            try:
+                await progress_cb(done, size)
+            except Exception:
+                pass
+
+    return asyncio.create_task(_poll())
 
 
 # ============== S3 UPLOAD ==============
@@ -858,6 +999,9 @@ def s3_public_url(key):
 # para sobrevivir reinicios (si el disco es efímero, se re-aprende).
 _NS_STATE_FILE = os.path.join(DOWNLOAD_PATH, "s3_namespace_state.json")
 _ns_order = None
+# Referencias fuertes a los guardianes anti-barrido en segundo plano
+# (sin ellas, asyncio podría recolectar la tarea a media espera).
+_guardian_tasks = set()
 
 
 def _ns_candidates():
@@ -898,7 +1042,7 @@ def _ns_reorder(winner=None, loser=None):
             pass
 
 
-async def _s3_put_direct(temp_path, key, filename, size):
+async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None):
     """Subida unsigned (toDus): UN solo PUT HTTP con el archivo en streaming.
 
     Es exactamente el método de todus-client y de los bots que funcionan
@@ -918,6 +1062,7 @@ async def _s3_put_direct(temp_path, key, filename, size):
         total=None, connect=30, sock_connect=30, sock_read=600
     )
     f = open(temp_path, "rb")
+    poll = _start_put_progress(f, size, progress_cb)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Pasar el file object hace que aiohttp fije Content-Length y
@@ -952,19 +1097,23 @@ async def _s3_put_direct(temp_path, key, filename, size):
     except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
         raise _S3RetryableError(f"error de red subiendo a S3: {e}") from e
     finally:
+        if poll is not None:
+            poll.cancel()
         try:
             f.close()
         except Exception:
             pass
 
 
-async def _s3_put_signed(temp_path, key, filename, size):
+async def _s3_put_signed(temp_path, key, filename, size, progress_cb=None):
     """Subida firmada (S3_UNSIGNED=0): boto3 en un hilo, como antes.
 
     En un S3 de verdad (AWS/MinIO/R2) el multipart de boto3 es correcto;
     solo se corrigen Content-Type/Content-Disposition y la clasificación
     de errores reintentables (5xx/red) frente a definitivos (4xx).
     """
+    loop = asyncio.get_running_loop() if progress_cb is not None else None
+
     def _do_upload():
         import boto3
         client = boto3.client(
@@ -975,6 +1124,16 @@ async def _s3_put_signed(temp_path, key, filename, size):
             region_name=S3_REGION,
             config=_S3_CONFIG,
         )
+        done = [0]
+
+        def _cb(nbytes):
+            done[0] += nbytes
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    progress_cb(done[0], size), loop)
+            except Exception:
+                pass
+
         with open(temp_path, "rb") as f:
             client.upload_fileobj(
                 f, S3_BUCKET, key,
@@ -983,6 +1142,7 @@ async def _s3_put_signed(temp_path, key, filename, size):
                     "ContentDisposition": _content_disposition(filename),
                 },
                 Config=_TRANSFER_CONFIG,
+                Callback=_cb if loop is not None else None,
             )
 
     try:
@@ -1112,7 +1272,8 @@ async def _verify_s3_object(url, expected_size):
     return "unverifiable", last_detail
 
 
-async def _upload_and_verify(temp_path, key, url, filename, size):
+async def _upload_and_verify(temp_path, key, url, filename, size,
+                               progress_cb=None):
     """Sube a UNA key con reintentos y verifica que el objeto quedó.
 
     Devuelve None si el objeto quedó activo (o no verificable en un
@@ -1126,7 +1287,7 @@ async def _upload_and_verify(temp_path, key, url, filename, size):
         async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
             for attempt in range(1, S3_UPLOAD_RETRIES + 1):
                 try:
-                    await put(temp_path, key, filename, size)
+                    await put(temp_path, key, filename, size, progress_cb)
                 except _S3RetryableError as e:
                     last_error = str(e)
                     log.warning(
@@ -1413,7 +1574,7 @@ def _todus_file_type(filename):
     return _TODUS_TYPE_BY_EXT.get(ext, 0)
 
 
-async def _put_presigned(temp_path, url, size):
+async def _put_presigned(temp_path, url, size, progress_cb=None):
     """PUT en streaming a la URL prefirmada que asignó el servidor.
 
     Igual que la app oficial (y que ToDusFileMixin.upload_file):
@@ -1429,6 +1590,7 @@ async def _put_presigned(temp_path, url, size):
         total=None, connect=30, sock_connect=30, sock_read=600
     )
     f = open(temp_path, "rb")
+    poll = _start_put_progress(f, size, progress_cb)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.put(url, data=f, headers=headers) as resp:
@@ -1449,6 +1611,8 @@ async def _put_presigned(temp_path, url, size):
     except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
         raise _S3RetryableError(f"error de red en el PUT oficial: {e}") from e
     finally:
+        if poll is not None:
+            poll.cancel()
         try:
             f.close()
         except Exception:
@@ -1529,7 +1693,8 @@ async def _todus_reserve(phone, token, size, ftype, filename):
     raise RuntimeError(f"reserva de toDus falló: {last_err}")
 
 
-async def _upload_official(temp_path, filename, size, status_cb=None):
+async def _upload_official(temp_path, filename, size, status_cb=None,
+                           progress_cb=None):
     """Sube por el flujo oficial y devuelve la URL de descarga.
 
     Lanza excepción ante cualquier fallo: subir_a_s3 decide entonces
@@ -1562,7 +1727,8 @@ async def _upload_official(temp_path, filename, size, status_cb=None):
         async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
             for attempt in range(1, S3_UPLOAD_RETRIES + 1):
                 try:
-                    await _put_presigned(temp_path, put_url, size)
+                    await _put_presigned(temp_path, put_url, size,
+                                         progress_cb)
                     last_err = None
                     break
                 except _S3RetryableError as e:
@@ -1618,8 +1784,52 @@ async def _upload_official(temp_path, filename, size, status_cb=None):
     return deliver
 
 
-async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
-    """Sube el archivo a S3 y devuelve (url_principal, [urls_espejo]).
+async def _settle_guardian(collected, size, settle, repair_cb):
+    """Vigía en segundo plano de la entrega inmediata (S3_DELIVER_FAST).
+
+    Duerme el settle y recomprueba cada copia YA entregada. Actualiza
+    la memoria de namespaces y llama UNA vez a repair_cb(urls_vivas):
+    quien entregó edita entonces su mensaje (confirmar quitando el
+    aviso, intercambiar el principal por el espejo, o marcar el error
+    si urls_vivas viene vacía). Nunca re-sube: el archivo temporal ya
+    pudo haberse limpiado; el seguro son las copias ya subidas.
+    """
+    try:
+        await asyncio.sleep(settle)
+        survivors = []
+        for prefix, url in collected:
+            state, detail = await _verify_s3_object(url, size)
+            if state == "dead":
+                log.warning(
+                    f"S3 guardián: el barrido eliminó {url} tras la "
+                    f"entrega ({detail}); namespace relegado")
+                await asyncio.to_thread(_ns_reorder, None, prefix)
+            else:
+                survivors.append((prefix, url))
+        if survivors:
+            await asyncio.to_thread(_ns_reorder, survivors[0][0], None)
+        log.info(
+            f"S3 guardián: {len(survivors)}/{len(collected)} copias "
+            f"siguen vivas tras {settle}s")
+        if repair_cb is not None:
+            try:
+                await repair_cb([u for _, u in survivors])
+            except Exception as e:
+                log.warning(f"S3 guardián: repair_cb falló: {e}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("S3 guardián: error inesperado")
+
+
+async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
+                     progress_cb=None, repair_cb=None):
+    """Sube el archivo a S3.
+
+    Devuelve (url_principal, [urls_espejo], verificacion_pendiente):
+    el tercer valor es True si un guardián sigue vigilando los enlaces
+    en segundo plano (entrega inmediata) y puede llamar a repair_cb
+    con las URLs que sigan vivas tras el settle.
 
     Por qué espejos + espera anti-barrido (medido con
     scripts/probe_todus.py): el bucket público de toDus barre sin
@@ -1627,13 +1837,17 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
     refugio durante días, amaneció vacío al día siguiente). Un solo
     namespace fijo es cuestión de tiempo que caiga. Por eso:
 
-    1. Se sube a S3_MIRRORS namespaces candidatos (en el orden
-       aprendido: el último que sobrevivió, primero).
-    2. Se espera S3_SETTLE_SECONDS y se comprueba que siguen vivos
-       ANTES de entregar ningún enlace (el barrido rápido actúa en
-       <2 min, así que un enlace entregado ya superó esa ventana;
-       contra los barridos lentos — users/df/ murió a los 10-18 min —
-       el seguro es el espejo del punto 3, no la espera).
+    1. Se sube a S3_MIRRORS namespaces candidatos A LA VEZ (en el
+       orden aprendido: el último que sobrevivió, primero).
+    2. Entrega inmediata (S3_DELIVER_FAST=1, por defecto): el enlace
+       se devuelve en cuanto la primera verificación pasa y un
+       guardián espera S3_SETTLE_SECONDS en segundo plano y
+       recomprueba que las copias siguen vivas (el barrido rápido
+       actúa en <2 min); si alguna murió, repair_cb corrige el
+       mensaje ya entregado. Con S3_DELIVER_FAST=0 la espera vuelve a
+       ser bloqueante antes de entregar nada. Contra los barridos
+       lentos (users/df/ murió a los 10-18 min) el seguro es el
+       espejo del punto 3, no la espera.
     3. Se entregan TODOS los enlaces vivos (principal + espejo): si
        un namespace cae mañana, el otro puede seguir funcionando.
     4. El namespace que muere queda relegado al final para la
@@ -1660,7 +1874,7 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
     if _todus_official_enabled():
         try:
             url = await _upload_official(
-                temp_path, filename, size, status_cb)
+                temp_path, filename, size, status_cb, progress_cb)
             mirrors = []
             if TODUS_ANON_MIRROR and S3_UNSIGNED:
                 try:
@@ -1668,14 +1882,15 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
                     mkey = build_s3_key(user_id, filename, pfx)
                     murl = s3_public_url(mkey)
                     await _upload_and_verify(
-                        temp_path, mkey, murl, filename, size)
+                        temp_path, mkey, murl, filename, size,
+                        progress_cb=progress_cb)
                     mirrors = [murl]
                 except Exception as e:
                     log.warning(
                         f"ToDus: espejo anónimo falló (se ignora): {e}")
             log.info(
                 f"ToDus oficial OK final: principal={url} espejos={mirrors}")
-            return url, mirrors
+            return url, mirrors, False
         except Exception as e:
             log.warning(
                 f"ToDus oficial falló ({e}); se cae a la vía anónima "
@@ -1697,29 +1912,78 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
             except Exception:
                 pass
 
+    _prog = {}
+
+    async def _agg_progress(tag, done):
+        # % conjunto de las subidas concurrentes: bytes subidos entre
+        # todas las copias objetivo (principal + espejos a la vez).
+        if progress_cb is None:
+            return
+        _prog[tag] = done
+        try:
+            await progress_cb(sum(_prog.values()), size * mirrors)
+        except Exception:
+            pass
+
     async def _collect(prefixes):
+        # Las copias objetivo suben A LA VEZ (antes iban una tras otra
+        # y el "Subiendo" duraba el doble con espejos). Si alguna se
+        # agota, se prueba el siguiente candidato hasta completar.
         got = []
-        for prefix in prefixes:
-            if len(collected) + len(got) >= mirrors:
-                break
+        pending = list(prefixes)
+
+        async def _one(prefix):
             tried.append(prefix)
             key = build_s3_key(user_id, filename, prefix)
             url = s3_public_url(key)
-            await _notify("uploading")
+
+            async def _p(done, _total, _tag=prefix):
+                await _agg_progress(_tag, done)
+
             try:
-                await _upload_and_verify(temp_path, key, url, filename, size)
+                await _upload_and_verify(
+                    temp_path, key, url, filename, size,
+                    progress_cb=_p if progress_cb else None)
             except _S3UploadExhausted as e:
                 errors.append(f"{prefix or 'raíz'}: {e}")
                 log.warning(f"S3: namespace '{prefix}' agotado: {e}")
                 await asyncio.to_thread(_ns_reorder, None, prefix)
-                continue
-            got.append((prefix, url))
+                return None
+            return (prefix, url)
+
+        while pending and len(collected) + len(got) < mirrors:
+            want = mirrors - len(collected) - len(got)
+            batch, pending = pending[:want], pending[want:]
+            await _notify("uploading")
+            results = await asyncio.gather(
+                *[_one(p) for p in batch], return_exceptions=True)
+            for r in results:
+                if isinstance(r, BaseException):
+                    raise r  # 4xx definitivo: fallar rápido, como siempre
+                if r is not None:
+                    got.append(r)
         return got
 
     collected += await _collect(candidates)
 
-    # Espera anti-barrido (hasta 2 rondas si todo muere y quedan
-    # namespaces por probar).
+    # Entrega inmediata: el settle lo vigila el guardián en segundo
+    # plano; aquí ya no se duerme nada (esa espera era lo que hacía
+    # que "Subiendo/Verificando" pareciera colgado durante minutos).
+    if collected and settle > 0 and S3_DELIVER_FAST:
+        winner = collected[0][0]
+        await asyncio.to_thread(_ns_reorder, winner, None)
+        urls = [u for _, u in collected]
+        task = asyncio.create_task(
+            _settle_guardian(list(collected), size, settle, repair_cb))
+        _guardian_tasks.add(task)
+        task.add_done_callback(_guardian_tasks.discard)
+        log.info(
+            f"S3 OK (entrega inmediata, guardián {settle}s): "
+            f"principal={urls[0]} espejos={urls[1:]}")
+        return urls[0], urls[1:], True
+
+    # Modo clásico (S3_DELIVER_FAST=0): espera anti-barrido bloqueante
+    # (hasta 2 rondas si todo muere y quedan namespaces por probar).
     for _round in range(2):
         if not collected or settle <= 0:
             break
@@ -1763,10 +2027,11 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
     await asyncio.to_thread(_ns_reorder, winner, None)
     urls = [u for _, u in collected]
     log.info(f"S3 OK final: principal={urls[0]} espejos={urls[1:]}")
-    return urls[0], urls[1:]
+    return urls[0], urls[1:], False
 
 # ============== DOWNLOAD ==============
-async def _download_sequential(session, url, temp_path, total, job):
+async def _download_sequential(session, url, temp_path, total, job,
+                               progress_cb=None):
     downloaded = 0
     final_size = None
     content_type = None
@@ -1781,10 +2046,13 @@ async def _download_sequential(session, url, temp_path, total, job):
                 downloaded += len(chunk)
                 if downloaded > MAX_FILE_SIZE:
                     raise RuntimeError("Archivo supera el límite")
+                if progress_cb is not None:
+                    await progress_cb(downloaded, final_size or total)
     return downloaded, ct
 
 
-async def _download_parallel(session, url, temp_path, total, job):
+async def _download_parallel(session, url, temp_path, total, job,
+                             progress_cb=None):
     """Descarga paralela. Rechaza respuestas 200 (deben ser 206)."""
     if total <= 0:
         raise RuntimeError("Tamaño desconocido, no se puede descargar en paralelo")
@@ -1798,6 +2066,7 @@ async def _download_parallel(session, url, temp_path, total, job):
         parts.append((i, start, end))
 
     part_paths = [None] * n_parts
+    part_done = [0] * n_parts
     content_type = None
 
     async def download_part(idx, start, end):
@@ -1827,6 +2096,9 @@ async def _download_parallel(session, url, temp_path, total, job):
                     bytes_received += len(chunk)
                     if bytes_received > (end - start + 1) + 1024 * 1024:
                         raise RuntimeError(f"Parte {idx} excede tamaño esperado")
+                    part_done[idx] = bytes_received
+                    if progress_cb is not None:
+                        await progress_cb(sum(part_done), total)
         part_paths[idx] = path
         return path
 
@@ -1895,90 +2167,32 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
         return None, str(e)[:200]
 
 
-# ============== UDYAT (descarga sin megas, solo Cuba) ==============
-# En Cuba, descargar de s3.todus.cu consume megas facturables, pero el
-# mismo MinIO responde en una IP interna (UDYAT_FREE_IP) que ETECSA no
-# factura. La receta del cliente (sistema UDYAT; formato documentado en
-# juanbas2005/todus-s3-api §15): conectar a la IP con las cabeceras
-# Host: s3.todus.cu y User-Agent: Wget/1.21.3, ignorando el certificado
-# self-signed. El bot no puede hacer eso por el usuario (depende de su
-# red y de su gestor), pero sí generarle el manifiesto .udyat listo
-# para importar en la app IroS3Dl:
-#   {"f": nombre, "s": tamaño, "md5": ..., "c": [{"url", "size"}],
-#    "h": IP gratuita, "original_host": "s3.todus.cu",
-#    "platform": "android"}
-# Se emite UN solo chunk con la URL principal, como el ejemplo
-# documentado: la semántica de una lista con varios chunks no está
-# documentada (¿partes? ¿alternativas?) y arriesgaría la descarga.
+# ============== LOTE: enlaces.txt para IDM (Android) ==============
+def _build_idm_txt(results):
+    """Contenido del .txt de lote: UNA URL por línea y nada más.
 
-def _udyat_supported():
-    """UDYAT solo tiene sentido contra el bucket público de toDus."""
-    return (
-        S3_UNSIGNED
-        and (urlparse(S3_ENDPOINT).hostname or "") == "s3.todus.cu"
-    )
-
-
-def _md5_file_sync(path):
-    """MD5 hex de un archivo en streaming (se llama vía to_thread)."""
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def _udyat_free_url(public_url):
-    """Reescribe el host de la URL pública a la IP gratuita (UDYAT)."""
-    return urlparse(public_url)._replace(netloc=UDYAT_FREE_IP).geturl()
-
-
-def build_udyat_manifest(public_url, filename, size, md5_hex):
-    """Manifiesto .udyat (IroS3Dl) para descargar sin gastar megas."""
-    return {
-        "f": os.path.basename(filename or "archivo.bin"),
-        "s": size,
-        "md5": md5_hex,
-        "c": [{"url": _udyat_free_url(public_url), "size": size}],
-        "h": UDYAT_FREE_IP,
-        "original_host": urlparse(public_url).hostname or "s3.todus.cu",
-        "platform": "android",
-    }
-
-
-async def _maybe_send_udyat(job, chat_id, temp_path, filename, size, public_url):
-    """Si el usuario activó /udyat, le envía el manifiesto .udyat.
-
-    Nunca rompe el flujo principal: cualquier fallo aquí solo se loguea.
+    Es el formato que IDM+/1DM+ importa con "Import links from file":
+    cualquier línea extra (títulos, comentarios) puede crear descargas
+    fantasma, así que el archivo lleva SOLO las URLs.
     """
-    if not SEND_UDYAT_VIA_TG or job.user_id not in _udyat_users:
-        return
-    if not _udyat_supported():
-        return
-    try:
-        md5_hex = await asyncio.to_thread(_md5_file_sync, temp_path)
-        manifest = build_udyat_manifest(public_url, filename, size, md5_hex)
-        data = json.dumps(
-            manifest, ensure_ascii=False, indent=2
-        ).encode("utf-8")
-        stem = (
-            os.path.splitext(os.path.basename(filename or "archivo"))[0]
-            or "archivo"
-        )
-        payload = io.BytesIO(data)
-        payload.name = f"{stem}.udyat"
-        await _tg_client.send_file(
-            chat_id, file=payload,
-            caption=(
-                "🆓 Manifiesto UDYAT: impórtalo en IroS3Dl (mantén "
-                "presionado el botón ➕) para descargar SIN gastar "
-                "megas (solo desde Cuba)."
-            ),
-            force_document=True,
-        )
-        log.info(f"UDYAT enviado a {chat_id}: {payload.name}")
-    except Exception as e:
-        log.warning(f"No se pudo enviar el manifiesto UDYAT a {chat_id}: {e}")
+    return ("\n".join(url for _name, url in results) + "\n").encode("utf-8")
+
+
+async def _send_links_txt(chat_id, results):
+    """Envía el .txt con todos los enlaces del lote."""
+    payload = io.BytesIO(_build_idm_txt(results))
+    payload.name = f"enlaces_{time.strftime('%Y%m%d_%H%M')}.txt"
+    await _tg_client.send_file(
+        chat_id, file=payload, force_document=True,
+        caption=(
+            f"📋 {len(results)} enlaces del lote — en IDM/1DM+ importa "
+            "este .txt con «Importar desde archivo».\n"
+            "Si toDus borra algún enlace, el mensaje de ese archivo se "
+            "actualiza solo con el nuevo."
+        ),
+    )
+    log.info(
+        f"Lote: {payload.name} enviado a {chat_id} ({len(results)} URLs)")
 
 
 # ============== MAIN PROCESSOR ==============
@@ -2059,18 +2273,28 @@ async def _process_tg_media(job):
         job.temp_paths.append(temp_path)
 
         check_disk_space()
-        # Mensaje de progreso único, minimalista
-        await tg_edit_status(
+        # Un solo mensaje para todo el trabajo: se va editando
+        # (Recibiendo % → Subiendo % → tarjeta final con el enlace).
+        status_msg = await tg_edit_status(
             chat_id, status_msg,
             _render_status_progress("receiving", safe_name, size_hint)
         )
 
-        # Descargar con Telethon
+        async def _emit_recv(pct):
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress(
+                    "receiving", safe_name, size_hint, pct))
+
+        recv_progress = _ThrottledProgress(_emit_recv)
+
+        # Descargar con Telethon (con % en vivo)
         try:
             async with asyncio.timeout(1800):
                 await _tg_client.download_media(
                     message=message,
                     file=temp_path,
+                    progress_callback=recv_progress.report,
                 )
         except asyncio.TimeoutError:
             raise RuntimeError("Tiempo agotado descargando desde Telegram")
@@ -2087,19 +2311,62 @@ async def _process_tg_media(job):
         filename = safe_name
 
         # Mensaje de progreso: subiendo
-        await tg_edit_status(
+        status_msg = await tg_edit_status(
             chat_id, status_msg,
             _render_status_progress("uploading", filename, size)
         )
 
         async def _s3_status(text):
-            await tg_edit_status(chat_id, status_msg, text)
+            nonlocal status_msg
+            status_msg = await tg_edit_status(chat_id, status_msg, text)
 
-        url_final, _url_espejos = await subir_a_s3(
+        async def _emit_up(pct):
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress("uploading", filename, size, pct))
+
+        up_progress = _ThrottledProgress(_emit_up)
+
+        # Si el guardián anti-barrido detecta tras la entrega que el
+        # servidor borró alguna copia, corrige ESTE mismo mensaje.
+        async def _repair(alive_urls):
+            nonlocal status_msg
+            if not alive_urls:
+                job.result_url = None
+                status_msg = await tg_edit_status(
+                    chat_id, status_msg,
+                    _render_error(
+                        f"El servidor eliminó «{filename}» a los pocos "
+                        "minutos de subirlo (barrido de toDus). "
+                        "Reenvíalo, por favor."))
+                return
+            job.result_url = alive_urls[0]
+            changed = (
+                alive_urls[0] != url_final
+                or (alive_urls[1:2] or [None])[0] != url_espejo)
+            if send_file and not changed:
+                return  # el archivo ya se envió; nada que corregir
+            note_rep = (
+                "↻ enlace actualizado: el anterior fue borrado por el "
+                "servidor" if alive_urls[0] != url_final else None)
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size,
+                    s3_url=alive_urls[0],
+                    mirror_url=alive_urls[1] if len(alive_urls) > 1 else None,
+                    source=source_label, note=note_rep))
+
+        url_final, _url_espejos, _pending = await subir_a_s3(
             temp_path, filename, size, user_id=job.user_id,
-            status_cb=_s3_status,
+            status_cb=_s3_status, progress_cb=up_progress.report,
+            repair_cb=_repair,
         )
         url_espejo = _url_espejos[0] if _url_espejos else None
+        _note = ("⏳ comprobando que el enlace sobrevive…"
+                 if _pending else None)
+        job.result_url = url_final
+        job.result_name = filename
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
@@ -2110,16 +2377,17 @@ async def _process_tg_media(job):
         send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
 
         if not send_file:
-            # Solo URL como texto (default)
-            await tg_edit_status(
+            # Solo URL como texto (default): el mensaje de estado SE
+            # CONVIERTE en la tarjeta final (cero mensajes extra).
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
                     name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
-                    source=source_label
+                    source=source_label, note=_note
                 )
             )
+            job.status_msg = status_msg
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
-            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
@@ -2134,21 +2402,21 @@ async def _process_tg_media(job):
         if tipo:
             log.info(f"OK enviado {tipo} a {chat_id}: {filename}")
             # El archivo ya fue enviado con el caption. El status_msg final lo reemplazamos por algo limpio.
-            await tg_edit_status(
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}"
             )
         else:
             # Falló el envío → al menos la URL quedó en el caption intentado. Mostramos URL y error.
             err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
-            await tg_edit_status(
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
                     name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
-                    source=source_label
+                    source=source_label, note=_note
                 ) + f"\n\n{_render_error(err_msg)}"
             )
-        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
+        job.status_msg = status_msg
 
     except asyncio.CancelledError:
         try:
@@ -2193,11 +2461,19 @@ async def _process_url(job):
 
     try:
         check_disk_space()
-        # Estado inicial: descargando
-        await tg_edit_status(
+        # Un solo mensaje para todo el trabajo: se va editando
+        # (Descargando % → Subiendo % → tarjeta final con el enlace).
+        status_msg = await tg_edit_status(
             chat_id, status_msg,
             _render_status_progress("downloading", filename)
         )
+
+        async def _emit_dl(pct):
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress("downloading", filename, None, pct))
+
+        dl_progress = _ThrottledProgress(_emit_dl)
 
         async with aiohttp.ClientSession() as session:
             async with asyncio.timeout(1200):
@@ -2228,19 +2504,22 @@ async def _process_url(job):
                 ):
                     try:
                         size_downloaded, content_type = await _download_parallel(
-                            session, url, temp_path, total, job
+                            session, url, temp_path, total, job,
+                            dl_progress.report
                         )
                     except RuntimeError as e:
                         if "no soporta Range" in str(e):
                             log.info("Cayendo a descarga secuencial")
                             size_downloaded, content_type = await _download_sequential(
-                                session, url, temp_path, total, job
+                                session, url, temp_path, total, job,
+                                dl_progress.report
                             )
                         else:
                             raise
                 else:
                     size_downloaded, content_type = await _download_sequential(
-                        session, url, temp_path, total, job
+                        session, url, temp_path, total, job,
+                        dl_progress.report
                     )
 
         # Si la URL no tenía extensión clara, usar Content-Type
@@ -2262,19 +2541,62 @@ async def _process_url(job):
         size = os.path.getsize(temp_path)
 
         # Estado: subiendo
-        await tg_edit_status(
+        status_msg = await tg_edit_status(
             chat_id, status_msg,
             _render_status_progress("uploading", filename, size)
         )
 
         async def _s3_status(text):
-            await tg_edit_status(chat_id, status_msg, text)
+            nonlocal status_msg
+            status_msg = await tg_edit_status(chat_id, status_msg, text)
 
-        url_final, _url_espejos = await subir_a_s3(
+        async def _emit_up(pct):
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress("uploading", filename, size, pct))
+
+        up_progress = _ThrottledProgress(_emit_up)
+
+        # Si el guardián anti-barrido detecta tras la entrega que el
+        # servidor borró alguna copia, corrige ESTE mismo mensaje.
+        async def _repair(alive_urls):
+            nonlocal status_msg
+            if not alive_urls:
+                job.result_url = None
+                status_msg = await tg_edit_status(
+                    chat_id, status_msg,
+                    _render_error(
+                        f"El servidor eliminó «{filename}» a los pocos "
+                        "minutos de subirlo (barrido de toDus). "
+                        "Reenvíalo, por favor."))
+                return
+            job.result_url = alive_urls[0]
+            changed = (
+                alive_urls[0] != url_final
+                or (alive_urls[1:2] or [None])[0] != url_espejo)
+            if send_file and not changed:
+                return  # el archivo ya se envió; nada que corregir
+            note_rep = (
+                "↻ enlace actualizado: el anterior fue borrado por el "
+                "servidor" if alive_urls[0] != url_final else None)
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size,
+                    s3_url=alive_urls[0],
+                    mirror_url=alive_urls[1] if len(alive_urls) > 1 else None,
+                    source="web", note=note_rep))
+
+        url_final, _url_espejos, _pending = await subir_a_s3(
             temp_path, filename, size, user_id=job.user_id,
-            status_cb=_s3_status,
+            status_cb=_s3_status, progress_cb=up_progress.report,
+            repair_cb=_repair,
         )
         url_espejo = _url_espejos[0] if _url_espejos else None
+        _note = ("⏳ comprobando que el enlace sobrevive…"
+                 if _pending else None)
+        job.result_url = url_final
+        job.result_name = filename
 
         name = re.sub(
             r"^[0-9a-f]{8}_", "",
@@ -2285,16 +2607,17 @@ async def _process_url(job):
         send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
 
         if not send_file:
-            # Default: solo URL como texto
-            await tg_edit_status(
+            # Default: solo URL como texto. El mensaje de estado SE
+            # CONVIERTE en la tarjeta final (cero mensajes extra).
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
                     name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
-                    source="web"
+                    source="web", note=_note
                 )
             )
+            job.status_msg = status_msg
             log.info(f"OK subido a S3 (textonly) para {chat_id}: {filename}")
-            await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
             return
 
         # Enviar archivo + caption
@@ -2308,20 +2631,20 @@ async def _process_url(job):
 
         if tipo:
             log.info(f"OK enviado {tipo} a {chat_id}: {filename}")
-            await tg_edit_status(
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}"
             )
         else:
             err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
-            await tg_edit_status(
+            status_msg = await tg_edit_status(
                 chat_id, status_msg,
                 _render_result_card(
                     name=name, ext=ext_out, size=size, s3_url=url_final, mirror_url=url_espejo,
-                    source="web"
+                    source="web", note=_note
                 ) + f"\n\n{_render_error(err_msg)}"
             )
-        await _maybe_send_udyat(job, chat_id, temp_path, filename, size, url_final)
+        job.status_msg = status_msg
 
     except asyncio.CancelledError:
         try:
@@ -2347,9 +2670,6 @@ async def _process_url(job):
 # Usuarios que han activado /sendfile (recibir el archivo además de la URL)
 # Por defecto el bot SOLO envía la URL (ahorra datos en toDus).
 _sendfile_users = set()
-# Usuarios que han activado /udyat (recibir el manifiesto .udyat para
-# descargar sin gastar megas vía IroS3Dl).
-_udyat_users = set()
 # Login de toDus en curso esperando el código SMS:
 # user_id -> {"phone": str (normalizado), "ts": float}
 _todus_pending_login = {}
@@ -2533,10 +2853,14 @@ async def on_tg_message(event):
             return
 
         if low == "/status":
-            active = job_queue.has_user_job(sender_id)
-            await event.respond(
-                _render_active_job() if active else "✓ Sin trabajos activos."
-            )
+            n = job_queue.position_hint(sender_id)
+            if n:
+                await event.respond(
+                    f"{ICON_PROCESSING} Tienes {n} trabajo(s) "
+                    "en curso o en cola."
+                )
+            else:
+                await event.respond("✓ Sin trabajos activos.")
             return
 
         if low in ("/sendfile", "/textonly"):
@@ -2546,21 +2870,6 @@ async def on_tg_message(event):
             else:
                 _sendfile_users.add(sender_id)
                 await event.respond(_render_sendfile_state(enabled=True))
-            return
-
-        if low in ("/udyat", "/sinmegas"):
-            if not SEND_UDYAT_VIA_TG or not _udyat_supported():
-                await event.respond(
-                    f"{ICON_ERROR} El manifiesto UDYAT no está disponible en este bot "
-                    "(solo aplica al S3 público de toDus)."
-                )
-                return
-            if sender_id in _udyat_users:
-                _udyat_users.discard(sender_id)
-                await event.respond(_render_udyat_state(enabled=False))
-            else:
-                _udyat_users.add(sender_id)
-                await event.respond(_render_udyat_state(enabled=True))
             return
 
         # ===== CUENTA DE TODUS (solo admin) =====
@@ -2592,14 +2901,14 @@ async def on_tg_message(event):
 
         # ===== DETECCIÓN DE MEDIA REENVIADA =====
         if event.message and event.message.media:
-            if job_queue.has_user_job(sender_id):
-                await event.respond(_render_busy())
-                return
-
-            # Mensaje inicial mínimo: el procesador lo editará después
-            status_msg = await tg_send_status(
-                chat_id, f"{ICON_PROCESSING} Procesando..."
+            # Sin rechazo: si ya hay algo en curso, este archivo espera
+            # en la cola (se suben uno a uno) y su mensaje lo indica.
+            ahead = job_queue.position_hint(sender_id)
+            initial = (
+                f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
+                if ahead else f"{ICON_PROCESSING} Procesando..."
             )
+            status_msg = await tg_send_status(chat_id, initial)
             job = QueuedJob(
                 user_id=sender_id, kind="tg_media", url=None,
                 original_name=None,
@@ -2610,15 +2919,7 @@ async def on_tg_message(event):
             async def _factory():
                 return await process_job(job)
 
-            try:
-                await job_queue.run(job, _factory)
-            except ValueError as e:
-                if "user_already_running" in str(e):
-                    await event.respond(_render_busy())
-                else:
-                    log.exception("job error")
-            except Exception:
-                log.exception("job error")
+            await job_queue.enqueue(job, _factory)
             return
 
         # ===== DETECCIÓN DE URL =====
@@ -2631,15 +2932,13 @@ async def on_tg_message(event):
             await event.respond(_render_no_url())
             return
 
-        if job_queue.has_user_job(sender_id):
-            await event.respond(_render_busy())
-            return
-
         url = match.group(1)
-        # Mensaje inicial mínimo — el procesador lo editará con el progreso
-        status_msg = await tg_send_status(
-            chat_id, f"{ICON_PROCESSING} Procesando..."
+        ahead = job_queue.position_hint(sender_id)
+        initial = (
+            f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
+            if ahead else f"{ICON_PROCESSING} Procesando..."
         )
+        status_msg = await tg_send_status(chat_id, initial)
         job = QueuedJob(
             user_id=sender_id, kind="url", url=url,
             chat_id=chat_id, status_msg=status_msg,
@@ -2648,15 +2947,7 @@ async def on_tg_message(event):
         async def _factory():
             return await process_job(job)
 
-        try:
-            await job_queue.run(job, _factory)
-        except ValueError as e:
-            if "user_already_running" in str(e):
-                await event.respond(_render_busy())
-            else:
-                log.exception("job error")
-        except Exception:
-            log.exception("job error")
+        await job_queue.enqueue(job, _factory)
 
     except Exception as e:
         log.exception(f"on_tg_message: {e}")
