@@ -93,8 +93,10 @@ services:
       # tumbando sin aviso. La OFICIAL reserva cada subida con una
       # cuenta de toDus (todus:purl) y el objeto queda registrado.
       # Login desde el bot: /toduslogin (SMS). Las credenciales se
-      # guardan en el disco (DOWNLOAD_PATH/todus_credentials.json);
-      # si el disco no persiste, usa TODUS_PHONE/TODUS_PASSWORD.
+      # guardan en DOWNLOAD_PATH/todus_credentials.json; OJO: el plan
+      # free no tiene disco y ese archivo se pierde al reiniciar. El
+      # bot muestra la contraseña una sola vez tras el login por SMS:
+      # fíjala aquí en TODUS_PHONE/TODUS_PASSWORD y entrará solo.
       - key: TODUS_UPLOAD_MODE
         # auto = oficial si hay cuenta y anónima si no/falla | anonymous = nunca SDK
         value: "auto"
@@ -111,7 +113,9 @@ services:
         # CSV de IDs que pueden usar /toduslogin en MODO BOT (en userbot, solo el dueño)
         sync: false
     disk:
-      # Disco efímero para descargas temporales
+      # Disco para temporales y credenciales. OJO: Render solo crea
+      # discos en planes de pago; con plan free este bloque NO crea
+      # disco (las descargas usan el /tmp efímero igualmente).
       name: tmp-downloads
       mountPath: /tmp/tg_uploads
       sizeGB: 1

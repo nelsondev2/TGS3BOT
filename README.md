@@ -196,7 +196,7 @@ La vía anónima depende de que el servidor respete algún *namespace*, y toDus 
 **Activarlo (una sola vez):**
 1. En **modo bot**, define `ADMIN_TG_IDS` con tu ID de Telegram (solo esos IDs pueden gestionar la cuenta; en modo userbot no hace falta: solo el dueño).
 2. Escríbele al bot `/toduslogin 53XXXXXXXX` con un número cubano que controles: toDus enviará un **SMS con un código** a ese número.
-3. Responde al bot con el código (o `/toduscode 123456`). El bot registra la cuenta, guarda la contraseña que devuelve el servidor en `DOWNLOAD_PATH/todus_credentials.json` (permisos 0600) y queda logueado.
+3. Responde al bot con el código (o `/toduscode 123456`). El bot registra la cuenta, guarda la contraseña que devuelve el servidor en `DOWNLOAD_PATH/todus_credentials.json` (permisos 0600) y queda logueado. Acto seguido te la muestra **una sola vez** (solo en chats privados): guárdala — es la que fijarás en `TODUS_PASSWORD` si tu servicio no tiene disco — y borra ese mensaje.
 4. Sube algo: en los logs verás `ToDus: reserva OK (persistent=True)` y las URLs asignadas por el servidor.
 
 Alternativa sin pasar por Telegram: define `TODUS_PHONE` y `TODUS_PASSWORD` en el entorno. Con `/todusstatus` ves el estado de la sesión y con `/toduslogout` la cierras (vuelve la vía anónima).
@@ -206,7 +206,7 @@ Alternativa sin pasar por Telegram: define `TODUS_PHONE` y `TODUS_PASSWORD` en e
 - El PUT va en streaming a la URL asignada, como la app (`application/octet-stream`, longitud exacta); si la URL prefirmada caduca (4xx) se vuelve a reservar. La URL de descarga se verifica antes de entregarla (GET con Range, porque un HEAD puede romper la firma de una URL prefirmada para GET) y las URLs cortas `todus.cu/...` se resuelven a la real.
 - El JWT se renueva solo cuando caduca, con la contraseña guardada.
 - **Fallback total:** si cualquier paso oficial falla (sin red hacia toDus, sesión rechazada, SDK caído…), la subida cae automáticamente a la vía anónima adaptativa de siempre. Nunca se pierde una subida por el SDK.
-- En Render, las credenciales sobreviven a los redespliegues solo si `DOWNLOAD_PATH` está en el disco (el `render.yaml` incluido monta uno en `/tmp/tg_uploads`); si no, repite el login o usa las variables de entorno.
+- En Render, las credenciales sobreviven a reinicios/redespliegues solo si `DOWNLOAD_PATH` está en un disco persistente — y **Render solo ofrece discos en planes de pago**: con `plan: free` el bloque `disk:` del blueprint no crea ningún disco y el login se perdería al primer reinicio. En el plan free, fija `TODUS_PHONE`/`TODUS_PASSWORD` (la contraseña te la muestra el bot una sola vez tras el login por SMS) y el bot entrará solo tras cada rearranque.
 
 **Seguridad:** el login usa el flujo *legítimo* de la app (SMS a tu número o tu contraseña). El SDK también documenta `login_with_phone_only`, que explota que `/v2/auth/token` acepta cualquier UUID como "contraseña" para entrar como **cualquier** número: es un bypass de autenticación del servidor y en este bot **no se usa** — todo pasa por una cuenta tuya de verdad.
 
@@ -417,7 +417,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 
 Si no quieres usar `TG_SESSION_STRING`, asegúrate de que:
 1. El disco persistente definido en `render.yaml` está correctamente montado en `/tmp/tg_uploads` (o el valor de `DOWNLOAD_PATH`).
-2. El plan de Render soporta discos persistentes (el plan free los soporta con tamaño máximo 1 GB).
+2. El plan de Render admite discos persistentes (⚠️ el plan **free NO** tiene discos: o subes a un plan de pago, o usas `TG_SESSION_STRING`/`TG_BOT_TOKEN` y `TODUS_PHONE`/`TODUS_PASSWORD` por entorno, que no necesitan disco).
 
 El bot guarda la sesión en `DOWNLOAD_PATH/tg_s3_bot.session`. Si ese path es persistente, no necesitas re-login en cada deploy.
 
