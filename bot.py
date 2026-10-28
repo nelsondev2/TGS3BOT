@@ -661,7 +661,7 @@ def _render_help(is_userbot=False, is_admin=False):
         "Si quieres recibir el archivo además de la URL, usa /sendfile.",
         "",
         "Descarga los enlaces pronto: el bucket público de toDus puede purgar archivos sin aviso.",
-        "Puedes reenviar **varios archivos seguidos**: se suben en cola, uno a uno, y al terminar te envío un `enlaces.txt` con todos los enlaces (uno por línea, listo para importar en IDM/1DM+).",
+        "Puedes reenviar **varios archivos seguidos**: se suben en cola, uno a uno, y al terminar te envío un `enlaces.txt` con todos los enlaces (uno por línea y cada uno con su nombre original, listo para importar en IDM/1DM+).",
         "",
         "Comandos",
         "  /cancel — cancela tu trabajo actual",
@@ -2171,11 +2171,25 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
 def _build_idm_txt(results):
     """Contenido del .txt de lote: UNA URL por línea y nada más.
 
-    Es el formato que IDM+/1DM+ importa con "Import links from file":
+    Es el formato que 1DM+/IDM importa con "Import links from file":
     cualquier línea extra (títulos, comentarios) puede crear descargas
     fantasma, así que el archivo lleva SOLO las URLs.
+
+    Cada línea termina en `#filename=<nombre>` (percent-encoded): es
+    el truco que documenta el propio 1DM+ (changelog 15.4: "add
+    #filename=filename at the end of the url") para que la descarga se
+    guarde con EXACTAMENTE ese nombre y no con el de la key S3
+    (`<stem>_<uuid8>` en la vía anónima; la que asigne toDus en la
+    oficial). El fragmento `#...` nunca viaja al servidor HTTP, así
+    que el GET es idéntico; si un gestor ignora el truco, sigue
+    mandando el Content-Disposition/la URL como siempre.
     """
-    return ("\n".join(url for _name, url in results) + "\n").encode("utf-8")
+    lines = []
+    for name, url in results:
+        if name and "#" not in url:
+            url = f"{url}#filename={quote(str(name), safe='')}"
+        lines.append(url)
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 async def _send_links_txt(chat_id, results):
@@ -2185,8 +2199,19 @@ async def _send_links_txt(chat_id, results):
     await _tg_client.send_file(
         chat_id, file=payload, force_document=True,
         caption=(
-            f"📋 {len(results)} enlaces del lote — en IDM/1DM+ importa "
-            "este .txt con «Importar desde archivo».\n"
+            f"📋 {len(results)} enlaces del lote, cada uno con su "
+            "nombre de archivo (se descargan con el nombre original).\n"
+            "\n"
+            "En 1DM+/IDM:\n"
+            "1) Descarga este .txt y déjalo en la carpeta Descargas.\n"
+            "2) Toca + → «Importar enlaces desde archivo».\n"
+            f"3) Si no aparece «{payload.name}» en su explorador "
+            "(pasa en Android 11+ por el scoped storage), toca el "
+            "icono de la MANO de la barra y búscalo con el selector "
+            "del sistema en Descargas.\n"
+            "Plan B: abre el .txt, copia todo su contenido y usa "
+            "«Importar desde el portapapeles».\n"
+            "\n"
             "Si toDus borra algún enlace, el mensaje de ese archivo se "
             "actualiza solo con el nuevo."
         ),
