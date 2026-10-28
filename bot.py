@@ -2690,6 +2690,30 @@ def _is_admin(user_id):
     return ADMIN_TG_IDS is not None and user_id in ADMIN_TG_IDS
 
 
+def _render_todus_password_reveal(phone, password):
+    """Mensaje ÚNICO con la contraseña recién emitida por el registro SMS.
+
+    Esa contraseña solo vive en todus_credentials.json: sin disco
+    persistente (Render free no tiene discos) se pierde en el primer
+    reinicio y tocaría registrarse de nuevo. Se muestra una sola vez
+    (y solo en chats privados) para poder fijarla en TODUS_PASSWORD,
+    con lo que el login se rehace solo tras cada rearranque.
+    """
+    return (
+        "🔑 **Contraseña de la cuenta (se muestra una sola vez)**\n\n"
+        f"`{password}`\n\n"
+        "⚠️ Cópiala ahora y **borra este mensaje**: es la llave de la "
+        "cuenta y no se puede recuperar.\n\n"
+        "Para que el login sobreviva reinicios y redespliegues de "
+        "Render **sin disco persistente** (plan free), define en "
+        "Environment de tu servicio:\n"
+        f"`TODUS_PHONE` = `{phone}`\n"
+        "`TODUS_PASSWORD` = la contraseña de arriba\n\n"
+        "Con eso, tras cada reinicio el bot entra solo en la primera "
+        "subida. Si tu servicio sí tiene disco, queda de respaldo."
+    )
+
+
 async def _todus_finish_login(event, sender_id, phone, code):
     """Completa el registro SMS: valida el código, hace login y guarda."""
     try:
@@ -2715,6 +2739,22 @@ async def _todus_finish_login(event, sender_id, phone, code):
         "asigna el enlace: queda fuera del barrido de anónimos). Si la "
         "vía oficial falla, el bot cae solo a la anterior.\n"
         "Estado cuando quieras: /todusstatus")
+    # Respaldo de una sola vez: la contraseña la acaba de emitir el
+    # servidor y el admin aún no la conoce. Solo en chats privados (en
+    # un grupo la vería cualquiera); en grupos se avisa de cómo pedirla.
+    try:
+        if getattr(event, "is_private", False):
+            await event.respond(
+                _render_todus_password_reveal(phone_n, password))
+        else:
+            await event.respond(
+                "🔑 No muestro la contraseña de respaldo en un grupo. "
+                "Si la quieres (para fijar TODUS_PASSWORD en Render y "
+                "que el login sobreviva reinicios sin disco), repite "
+                "/toduslogin en un chat privado conmigo.")
+    except Exception as e:
+        log.warning(
+            f"ToDus: no se pudo enviar la contraseña de respaldo: {e}")
 
 
 async def _todus_password_login(event, phone, password):
@@ -2733,7 +2773,10 @@ async def _todus_password_login(event, phone, password):
     await event.respond(
         f"{ICON_DONE} Sesión de toDus iniciada ({_mask_phone(phone_n)}).\n"
         "⚠️ Borra el mensaje con la contraseña: queda en el historial "
-        "del chat. La próxima vez basta el login automático.")
+        "del chat. La próxima vez basta el login automático.\n"
+        "💡 Y para que sobreviva reinicios sin disco (Render free), "
+        "fija estos mismos datos en Environment: TODUS_PHONE y "
+        "TODUS_PASSWORD.")
 
 
 async def _handle_todus_command(event, body, sender_id):
