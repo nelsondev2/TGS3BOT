@@ -10,9 +10,9 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 - ✅ **Allowlist de usuarios** opcional vía `ALLOWED_TG_IDS`
 - ✅ **Event loop no bloqueado**: llamadas síncronas envueltas en `asyncio.to_thread`
 - ✅ **Subida a toDus resistente al barrido**: PUT directo en una sola petición (sin multipart de boto3) y espejos en varios namespaces. Medido en vivo con `scripts/probe_todus.py` (26-27 oct): el bucket barre namespaces enteros sin aviso (la raíz y `users/tg_*` en <2 min; `dk/` cayó de un día para otro; `users/df/` pasó a morir a los 10-18 min; `hi/` es hoy el refugio más sólido) — eso era lo que hacía que los enlaces vencieran casi al instante
-- ✅ **Verificación + espera anti-barrido + memoria**: el enlace se entrega solo tras comprobar con HEAD (antes y después de una espera de 150 s) que el objeto sigue vivo; si desaparece, cae automáticamente al siguiente namespace y recuerda cuál sobrevivió. Se entrega **enlace principal + espejo** en otro namespace; nunca se entrega un enlace muerto como ✓
+- ✅ **Verificación + guardián anti-barrido + memoria**: el objeto se comprueba con HEAD al subir y el enlace se entrega **al instante** (principal + espejo, subidos en paralelo); un guardián en segundo plano espera 150 s, re-verifica las copias y, si el barrido borró alguna, **edita tu mensaje** con el enlace bueno (o marca el error). La memoria recuerda qué namespace sobrevive; con `S3_DELIVER_FAST=0` se vuelve a la espera bloqueante previa
 - 📲 **Subida OFICIAL a toDus (ToDus-SDK)**: con una cuenta de toDus (login desde el propio bot con `/toduslogin` por SMS), cada subida se **reserva** en el servidor (`todus:purl`, como la app oficial) y el objeto queda registrado fuera del barrido de anónimos. Si la vía oficial falla, cae sola a la anónima adaptativa. Es la respuesta a que hasta `hi/` acabara venciendo
-- 🆓 **Descarga sin megas (Cuba)**: con `/udyat` el bot envía además un manifiesto `.udyat` para la app IroS3Dl que apunta a la IP gratuita de toDus (`152.207.206.86`); la ayuda del bot trae también la receta manual para 1DM+ (cabeceras UDYAT)
+- 📋 **Varios archivos seguidos, sin rechazos**: reenvía los que quieras — se encolan y se suben **uno a uno**, cada uno en **un solo mensaje** que se edita con el % en vivo (`Recibiendo 45%` → `Subiendo 78%`) hasta convertirse en la tarjeta con el enlace. Al terminar un lote de ≥2 recibes un `enlaces.txt` con todas las URLs (una por línea), listo para importar en **IDM/1DM+** (Android)
 - ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
 - ✅ **Limpieza de archivos `.part`** en cancelación o fallo
@@ -139,8 +139,6 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `PARALLEL_URL_PARTS` | `4` | Partes paralelas |
 | `ALWAYS_SHOW_S3_URL` | `1` | Mostrar URL S3 siempre |
 | `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). Cambiar a `1` para reenviar archivo. Los usuarios pueden opt-in con `/sendfile` |
-| `SEND_UDYAT_VIA_TG` | `1` | Permite enviar el manifiesto `.udyat` (descarga sin megas en Cuba) a quien lo active con `/udyat`. Solo aplica si el S3 es `s3.todus.cu`. `0` desactiva la función |
-| `UDYAT_FREE_IP` | `152.207.206.86` | IP gratuita de toDus escrita en el manifiesto `.udyat` (respaldo conocido: `152.207.206.88`) |
 | `TODUS_UPLOAD_MODE` | `auto` | `auto` = vía oficial si hay cuenta de toDus (y anónima si no la hay o si la oficial falla). `official` = como `auto` (el fallback se mantiene por resiliencia). `anonymous` = nunca usar el SDK (comportamiento anterior) |
 | `TODUS_PHONE` | *(vacío)* | Número cubano (53XXXXXXXX) de la cuenta de toDus del bot. Opcional si haces login con `/toduslogin`; si está definida, manda sobre el número guardado |
 | `TODUS_PASSWORD` | *(vacío)* | Contraseña/secreto (96 hex) de esa cuenta. Opcional: `/toduslogin` la obtiene por SMS y la guarda en `todus_credentials.json` |
@@ -153,7 +151,8 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `S3_UNSIGNED` | `1` | S3 sin firma (toDus): subida con PUT directo. `0` = boto3 firmado contra tu propio S3 |
 | `S3_KEY_PREFIXES` | `hi,users/df,dk/tg_{user_id}` | Namespaces candidatos (CSV, en orden) para las keys: `<prefijo>/<user_id>/<nombre>_<rand>.<ext>`. El bot sube a `S3_MIRRORS` de ellos y recuerda cuál sobrevive (memoria en `s3_namespace_state.json`). Medido el 2026-10-27: `hi/` vive ≥28 min (objetos de ~16 h), `users/df/` muere a los 10-18 min, `dk/` y `video/` en <2 min. Acepta el placeholder `{user_id}` |
 | `S3_MIRRORS` | `2` | A cuántos namespaces subir cada archivo (principal + espejos). Solo en modo unsigned; con S3 propio firmado siempre es 1 |
-| `S3_SETTLE_SECONDS` | `150` | Espera anti-barrido: tras subir, espera este tiempo y re-verifica antes de entregar el enlace (caza el barrido rápido de <2 min; contra barridos lentos protege el espejo). `0` = desactivada |
+| `S3_SETTLE_SECONDS` | `150` | Ventana anti-barrido: un guardián espera este tiempo tras la entrega y re-verifica las copias (caza el barrido rápido de <2 min y edita tu mensaje si alguna murió; contra barridos lentos protege el espejo). `0` = desactivada |
+| `S3_DELIVER_FAST` | `1` | `1` = entrega inmediata en cuanto pasa la 1ª verificación (el settle lo vigila el guardián en segundo plano). `0` = esperar todo el settle antes de entregar ningún enlace (modo clásico) |
 | `S3_KEY_PREFIX` | *(heredado)* | Solo compatibilidad: `users`/`users/df` (valores viejos) = usar la lista por defecto de `S3_KEY_PREFIXES`. Cualquier otro valor se respeta como único namespace. `none` = raíz (solo buckets propios) |
 | `S3_UPLOAD_RETRIES` | `3` | Reintentos de subida + verificación ante fallos transitorios |
 | `S3_UPLOAD_TIMEOUT` | `1800` | Tiempo total máximo (s) para subir y verificar un archivo |
@@ -169,17 +168,16 @@ Ver `.env.example` para referencia.
 | Comando | Descripción |
 |---------|-------------|
 | `/start`, `hola`, `ayuda`, `help` | Mensaje de ayuda |
-| `/cancel`, `cancelar` | Cancela tu trabajo activo |
-| `/status` | Verifica si tienes trabajo en curso |
+| `/cancel`, `cancelar` | Cancela tu trabajo en curso y vacía tu cola |
+| `/status` | Muestra cuántos trabajos tienes en curso o en cola |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
-| `/udyat` (alias `/sinmegas`) | Toggle: recibir también el manifiesto `.udyat` para descargar sin gastar megas en Cuba (IroS3Dl) — por defecto OFF |
 | `/toduslogin <número>` | *(solo admin)* Login de la cuenta de toDus del bot por SMS (o `/toduslogin <número> <contraseña>`) |
 | `/toduscode <código>` | *(solo admin)* Completa el login por SMS (o responde solo con el código) |
 | `/todusstatus` | *(solo admin)* Estado de la sesión de toDus |
 | `/toduslogout` | *(solo admin)* Cierra la sesión de toDus (vuelve a la vía anónima) |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
 | `<URL>` | Procesa cualquier URL http/https |
-| `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
+| `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3. Puedes reenviar **varios seguidos**: suben en cola, uno a uno, y al final recibes un `enlaces.txt` con todos los enlaces para IDM/1DM+ |
 
 ### Comportamiento por defecto (ahorra datos)
 
@@ -190,15 +188,6 @@ Por defecto el bot **SOLO envía la URL S3 como texto**, no reenvía el archivo.
 Si quieres recibir el archivo además de la URL, escribe `/sendfile` una vez. Para volver al modo ahorro, escribe `/sendfile` otra vez.
 
 Para cambiar el comportamiento por defecto globalmente (todos los usuarios reciben archivo por defecto), configura la env var `SEND_FILE_VIA_TG=1`.
-
-### Descargar sin gastar megas (UDYAT, solo Cuba)
-
-El servidor `s3.todus.cu` responde también en una **IP interna que ETECSA no factura** (`152.207.206.86`), siempre que el cliente conecte a esa IP con las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3` e ignore el certificado self-signed (sistema UDYAT, documentado en el repo `juanbas2005/todus-s3-api`). El bot no puede hacer eso por el usuario, pero sí prepararle todo:
-
-- **IroS3Dl (automático):** activa `/udyat` en el bot y, tras cada subida, recibirás un archivo `<nombre>.udyat` (JSON de ~300 B con nombre, tamaño, MD5 y la URL ya reescrita a la IP gratuita). Descárgalo e impórtalo en IroS3Dl (mantén presionado el botón ➕ en la pantalla de descargas) y la app bajará el archivo sin consumir megas.
-- **1DM+ (manual):** 1DM+ admite cabeceras personalizadas por descarga. Añade una descarga con el enlace del bot **cambiando el host** por la IP: `https://152.207.206.86/stream/...`, y en las cabeceras (headers) de esa descarga pon `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`. Si la app avisa del certificado (esa IP usa uno self-signed), acéptalo para continuar.
-
-> ⚠️ Esto solo funciona desde la red cubana de ETECSA. Verifica la primera vez con un archivo pequeño y comprueba el saldo antes/después: que salga a 0 MB depende de cómo ETECSA clasifique esa IP, y la IP puede cambiar (ajústala con `UDYAT_FREE_IP`; respaldo conocido: `152.207.206.88`).
 
 ### Subida oficial con cuenta de toDus (ToDus-SDK) — la vía que no vence
 
@@ -230,10 +219,13 @@ El bot ahora usa mensajes limpios y profesionales, sin caracteres ruidosos ni in
 ⏳ Procesando...
 ```
 
-### Progreso (se edita en el mismo mensaje)
+### Progreso (un solo mensaje que se va editando, con % en vivo)
 ```
-⏳ Descargando archivo.mp4 · 15.2 MB
+⏳ En cola (posición 2)…
+⏳ Recibiendo 45% archivo.mp4 · 15.2 MB
+⏳ Subiendo 78% archivo.mp4 · 15.2 MB
 ```
+Ese mismo mensaje se convierte al final en la tarjeta con el enlace: no quedan mensajes intermedios sueltos en el chat.
 
 ### Resultado final (modo default, solo URL)
 ```
@@ -245,6 +237,8 @@ MP4 · 15.2 MB · nube
 🔗 https://s3.todus.cu/stream/hi/123456789/archivo_a1b2c3d4.mp4
 🔗 https://s3.todus.cu/stream/users/df/123456789/archivo_a1b2c3d4.mp4 (espejo)
 ```
+
+Mientras el guardián anti-barrido sigue vigilando, la tarjeta puede llevar una última línea `⏳ comprobando que el enlace sobrevive…` que desaparece sola al confirmarse (o el enlace se sustituye/edita si el servidor lo borra).
 
 ### Resultado final (modo `/sendfile`, recibe el archivo)
 ```
@@ -386,6 +380,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 15. La URL S3 se entregaba sin comprobar que el objeto existiera → verificación HEAD + tamaño con re-subida automática
 16. El fix de namespace fijo (`users/df/`) dejó de bastar en 24 h: toDus cambió el barrido y `users/df/` pasó a morir a los 10-18 min (y `dk/`, refugio el día anterior, a <2 min) → subida adaptativa: candidatos `S3_KEY_PREFIXES` con `hi/` primero, espejo en 2 namespaces, espera anti-barrido de 150 s antes de entregar y memoria persistente del namespace que sobrevive
 17. Ni la subida adaptativa bastó a la larga: el barrido rotó otra vez, tumbó también `hi/` y los enlaces volvieron a vencer → **vía oficial con ToDus-SDK**: reserva `todus:purl` con cuenta propia (login por SMS desde el bot con `/toduslogin`, solo admin), PUT a la URL que asigna el servidor, JWT auto-renovable y caída automática a la vía anónima si algo falla
+18. Reenviar varios archivos seguidos solo subía el primero («ya tienes un trabajo en curso» para el resto, y se perdían) y el «Subiendo» parecía colgado durante minutos: espejos secuenciales + espera anti-barrido bloqueante de 150 s + ninguna señal de progreso (y editar con el mismo texto creaba mensajes huérfanos) → **cola FIFO por usuario** con lote `enlaces.txt` para IDM/1DM+, espejos **en paralelo**, **% en vivo** en un único mensaje editado hasta entregar el enlace y guardián anti-barrido en segundo plano. Se elimina de paso toda la función UDYAT/`.udyat` (interfaz limpia)
 
 ## 🆘 Troubleshooting
 
@@ -395,7 +390,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 
 **Ahora el bot (adaptativo, sin namespace fijo):**
 1. Sube con un solo PUT en streaming (Content-Type real + Content-Disposition con el nombre original).
-2. Sube a **2 namespaces candidatos** (`S3_KEY_PREFIXES`, por defecto `hi` → `users/df` → `dk/tg_{user_id}`) y espera **`S3_SETTLE_SECONDS` (150 s)** para re-verificar que siguen vivos *antes* de entregar nada.
+2. Sube a **2 namespaces candidatos** (`S3_KEY_PREFIXES`, por defecto `hi` → `users/df` → `dk/tg_{user_id}`) **a la vez**, entrega el enlace al pasar la 1ª verificación y un guardián lo re-verifica durante **`S3_SETTLE_SECONDS` (150 s)**, editando tu mensaje si el barrido borra alguna copia (`S3_DELIVER_FAST=0` restaura la espera bloqueante *antes* de entregar nada).
 3. Entrega **enlace principal + espejo** en otro namespace: si un barrido lento tumba uno horas después, el otro puede seguir vivo. La tarjeta de resultado muestra ambos.
 4. Si un namespace muere, queda relegado al final y el superviviente pasa a ser el primero (memoria en `s3_namespace_state.json`): el bot se re-adapta solo cuando toDus cambia las reglas. Solo si *ningún* namespace deja el archivo vivo verás un error honesto en vez de enlaces muertos.
 
