@@ -210,6 +210,40 @@ SEND_UDYAT_VIA_TG = os.environ.get("SEND_UDYAT_VIA_TG", "1") == "1"
 # conocido: 152.207.206.88).
 UDYAT_FREE_IP = os.environ.get("UDYAT_FREE_IP", "152.207.206.86").strip() or "152.207.206.86"
 
+# --- ToDus oficial (ToDus-SDK) ---
+# La vía anónima depende de que el barrido respete algún namespace, y
+# toDus rota las reglas sin aviso (hi/ también acabó cayendo). La vía
+# con garantías es el flujo OFICIAL de la app: reservar la subida por
+# XMPP (todus:purl) con una cuenta de toDus, para que el servidor asigne
+# la key y el objeto quede registrado (ver nyxthor-dev/toDus-SDK).
+# "auto" (default): usa la vía oficial si hay cuenta configurada
+# (login desde el bot con /toduslogin, o TODUS_PHONE/TODUS_PASSWORD)
+# y cae a la anónima adaptativa si la oficial falla.
+# "official": como auto (el fallback se mantiene por resiliencia).
+# "anonymous": nunca usa el SDK (comportamiento anterior).
+TODUS_UPLOAD_MODE = os.environ.get("TODUS_UPLOAD_MODE", "auto").strip().lower() or "auto"
+# Credenciales de arranque (opcionales). El login interactivo del bot
+# (/toduslogin por SMS) guarda las suyas en DOWNLOAD_PATH; si estas env
+# están definidas, tienen prioridad sobre el número guardado.
+TODUS_PHONE = os.environ.get("TODUS_PHONE", "").strip()
+TODUS_PASSWORD = os.environ.get("TODUS_PASSWORD", "").strip()
+# Pedir la reserva como persistente (persistent='true' en todus:purl).
+# Si el servidor rechaza ese modo, se reintenta automáticamente con
+# persistent='false' (el modo chat de la app).
+TODUS_PERSISTENT = os.environ.get("TODUS_PERSISTENT", "1") == "1"
+# Tras una subida oficial OK, subir además una copia anónima como
+# espejo (doble subida; por defecto no).
+TODUS_ANON_MIRROR = os.environ.get("TODUS_ANON_MIRROR", "0") == "1"
+# Quién puede gestionar la cuenta de toDus desde Telegram
+# (/toduslogin, /toduslogout...). En modo userbot el dueño siempre
+# puede; en modo bot hacen falta IDs aquí (CSV). Sin esto, el login
+# interactivo queda deshabilitado (usar env TODUS_PHONE/PASSWORD).
+_admin_env = os.environ.get("ADMIN_TG_IDS", "").strip()
+ADMIN_TG_IDS = (
+    set(int(u) for u in _admin_env.replace(" ", "").split(",") if u)
+    if _admin_env else None
+)
+
 # --- HTTP Headers ---
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -532,7 +566,7 @@ def _render_cancel():
     return f"{ICON_CANCEL} Cancelado"
 
 
-def _render_help(is_userbot=False):
+def _render_help(is_userbot=False, is_admin=False):
     """Tarjeta de ayuda profesional."""
     lines = [
         f"🤖 **Bot S3** — sube archivos a la nube y te devuelve el enlace",
@@ -559,6 +593,15 @@ def _render_help(is_userbot=False):
             "👤 **Modo userbot**: solo respondo a mensajes del dueño.",
             "Pega enlaces o reenvía archivos en *Saved Messages* para usar el bot.",
         ])
+    if is_admin:
+        lines.extend([
+            "",
+            "🔐 **Admin — cuenta de toDus (vía oficial)**",
+            "  /toduslogin NÚMERO — login por SMS (o NÚMERO CONTRASEÑA)",
+            "  /toduscode 123456 — completar el login por SMS",
+            "  /todusstatus — estado de la sesión de toDus",
+            "  /toduslogout — cerrar sesión (vuelve a la vía anónima)",
+        ])
     return "\n".join(lines)
 
 
@@ -567,6 +610,44 @@ def _render_sendfile_state(enabled):
         return f"{ICON_DONE} Modo archivo activado\n\nA partir de ahora recibirás el archivo además de la URL."
     else:
         return f"{ICON_DONE} Modo archivo desactivado\n\nSolo recibirás la URL S3 (ahorra datos en toDus)."
+
+
+def _mask_phone(phone):
+    """5350123456 -> 53501…56 (no mostrar el número completo en chats)."""
+    p = str(phone or "")
+    return f"{p[:5]}…{p[-2:]}" if len(p) >= 8 else p
+
+
+def _render_todus_status():
+    creds = _todus_creds_load()
+    lines = ["📲 **Cuenta de toDus (vía oficial)**", ""]
+    phone = creds.get("phone") or ""
+    if not phone or not creds.get("password"):
+        lines += [
+            "Estado: sin cuenta configurada → las subidas van por la vía anónima.",
+            "",
+            "Para activarla: /toduslogin NÚMERO (registro por SMS), "
+            "/toduslogin NÚMERO CONTRASEÑA si ya tienes la contraseña, o "
+            "define TODUS_PHONE/TODUS_PASSWORD en el entorno.",
+        ]
+    else:
+        lines.append(f"Número: {_mask_phone(phone)}")
+        if creds.get("jwt"):
+            exp = creds.get("jwt_exp") or 0
+            if exp:
+                lines.append(
+                    "Sesión: activa (token hasta "
+                    + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(exp)) + ")")
+            else:
+                lines.append("Sesión: activa")
+        else:
+            lines.append(
+                "Sesión: credenciales guardadas; el login se hace al subir.")
+        via = ("oficial (reserva del servidor)" if _todus_official_enabled()
+               else "anónima (TODUS_UPLOAD_MODE=anonymous)")
+        lines.append(f"Vía de subida: {via}")
+    lines += ["", "/toduslogin · /toduscode · /toduslogout"]
+    return "\n".join(lines)
 
 
 def _render_udyat_state(enabled):
@@ -1090,6 +1171,453 @@ async def _upload_and_verify(temp_path, key, url, filename, size):
     raise _S3UploadExhausted(last_error)
 
 
+# ============== TODUS OFICIAL (ToDus-SDK) ==============
+# Flujo de la app oficial de toDus:
+#   1. Login con una cuenta real (número cubano): registro por SMS
+#      (users.reserve -> código -> users.register devuelve la
+#      contraseña/secreto de 96 hex) o contraseña ya conocida.
+#      POST auth.todus.cu/v2/auth/token -> JWT.
+#      NUNCA se usa el "login_with_phone_only" del SDK (es un bypass
+#      de autenticación del servidor: entrar como cualquier número).
+#   2. Reserva XMPP todus:purl con el tamaño y tipo de archivo: el
+#      servidor responde con la URL de subida (put, prefirmada) y la
+#      de descarga (get). El objeto queda registrado a nombre de la
+#      cuenta, fuera del barrido de anónimos.
+#   3. PUT en streaming a la URL asignada (application/octet-stream,
+#      como la app) y entrega de la URL get verificada.
+# Si CUALQUIER paso falla, subir_a_s3 cae a la vía anónima adaptativa.
+# El SDK (todus-sdk, sync) se importa de forma perezosa dentro de los
+# wrappers *_sync y se ejecuta con asyncio.to_thread.
+
+# Credenciales persistidas del login interactivo (como la sesión de TG:
+# viven en DOWNLOAD_PATH; en Render necesitan el disco del render.yaml
+# para sobrevivir redespliegues, o define TODUS_PHONE/PASSWORD).
+_TODUS_CREDS_FILE = os.path.join(DOWNLOAD_PATH, "todus_credentials.json")
+_todus_creds = None  # None = aún no cargado; dict tras la primera carga
+_todus_lock = asyncio.Lock()
+
+
+class _TodusTokenExpired(RuntimeError):
+    """El JWT de toDus caducó: hay que hacer login de nuevo."""
+
+
+def _todus_creds_load():
+    """Credenciales efectivas {phone, password, jwt, jwt_exp} (cache)."""
+    global _todus_creds
+    if _todus_creds is None:
+        data = {}
+        try:
+            with open(_TODUS_CREDS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            data = {}
+        _todus_creds = {
+            "phone": str(data.get("phone") or ""),
+            "password": str(data.get("password") or ""),
+            "jwt": str(data.get("jwt") or ""),
+            "jwt_exp": float(data.get("jwt_exp") or 0),
+        }
+        # Las env, si están, mandan sobre lo guardado (bootstrap).
+        if TODUS_PHONE:
+            if _todus_creds["phone"] != TODUS_PHONE:
+                _todus_creds["jwt"] = ""
+                _todus_creds["jwt_exp"] = 0
+            _todus_creds["phone"] = TODUS_PHONE
+        if TODUS_PASSWORD:
+            _todus_creds["password"] = TODUS_PASSWORD
+    return _todus_creds
+
+
+def _todus_creds_save():
+    """Persiste las credenciales en memoria a disco (0600)."""
+    try:
+        with open(_TODUS_CREDS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(_todus_creds, fh)
+        try:
+            os.chmod(_TODUS_CREDS_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning(f"ToDus: no se pudieron guardar las credenciales: {e}")
+
+
+def _todus_creds_clear():
+    """Cierra la sesión guardada (las env, si existen, siguen valiendo)."""
+    global _todus_creds
+    _todus_creds = {
+        "phone": TODUS_PHONE or "",
+        "password": TODUS_PASSWORD or "",
+        "jwt": "",
+        "jwt_exp": 0,
+    }
+    try:
+        os.unlink(_TODUS_CREDS_FILE)
+    except Exception:
+        pass
+
+
+def _todus_has_account():
+    creds = _todus_creds_load()
+    return bool(creds.get("phone") and creds.get("password"))
+
+
+def _todus_official_enabled():
+    """¿Procede intentar la vía oficial en esta subida?"""
+    return TODUS_UPLOAD_MODE != "anonymous" and _todus_has_account()
+
+
+def _jwt_exp(token):
+    """Epoch de caducidad del JWT (0 si no se puede saber)."""
+    try:
+        from todus import jwt_decode_payload
+        return float(jwt_decode_payload(token).get("exp") or 0)
+    except Exception:
+        return 0
+
+
+# --- Wrappers síncronos del SDK (se llaman con asyncio.to_thread) ---
+# Devuelven tuplas con el teléfono ya normalizado por el SDK
+# (53XXXXXXXX) y traducen TokenExpiredError a _TodusTokenExpired.
+
+def _todus_make_client(phone, password=""):
+    from todus import ToDusClient2
+    return ToDusClient2(phone_number=phone, password=password)
+
+
+def _todus_login_sync(phone, password):
+    """Login con contraseña -> (teléfono normalizado, JWT)."""
+    client = _todus_make_client(phone, password)
+    client.login()
+    if not client.token:
+        raise RuntimeError("login sin token")
+    return client.phone_number, client.token
+
+
+def _todus_request_code_sync(phone):
+    """Pide el SMS de registro -> teléfono normalizado."""
+    client = _todus_make_client(phone)
+    client.request_code()
+    return client.phone_number
+
+
+def _todus_validate_code_sync(phone, code):
+    """Valida el código SMS -> (teléfono normalizado, contraseña 96 hex)."""
+    client = _todus_make_client(phone)
+    client.validate_code(code)
+    if not client.password:
+        raise RuntimeError("el servidor no devolvió contraseña")
+    return client.phone_number, client.password
+
+
+def _todus_reserve_sync(phone, token, size, file_type, filename, persistent):
+    """Reserva todus:purl -> (put_url, get_url).
+
+    Réplica de ToDusFileMixin.reserve_upload_url pero pasando
+    persistent= (el SDK siempre reserva con persistent='false') y con
+    deadline propio (el bucle del SDK puede girar para siempre si el
+    servidor no responde nunca).
+    """
+    from todus import stanza, util
+    from todus.errors import TokenExpiredError as _SdkExpired
+    client = _todus_make_client(phone)
+    sid = util.generate_token(5)
+    sanitized = util.sanitize_filename(filename, int(file_type))
+    deadline = time.monotonic() + 60
+    try:
+        with client._xmpp_session(token) as sock:
+            sock.sendall(stanza.upload_query(
+                sid, size, int(file_type),
+                persistent=persistent, file_name=sanitized,
+            ).encode())
+            while True:
+                response = client._recv_all(sock)
+                if response is None:
+                    raise RuntimeError(
+                        "el servidor cerró la conexión durante la reserva")
+                if response == "":
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("timeout esperando la reserva (60 s)")
+                    continue
+                if "i='" + sid + "-3'" in response and "put='" in response:
+                    put = re.search(r"put=['\"]([^'\"]+)['\"]", response)
+                    get = re.search(r"get=['\"]([^'\"]+)['\"]", response)
+                    if put and get:
+                        return (put.group(1).replace("amp;", ""),
+                                get.group(1).replace("amp;", ""))
+                    raise RuntimeError("respuesta de reserva sin URLs")
+                if "<not-authorized/>" in response:
+                    raise _TodusTokenExpired("token rechazado en la reserva")
+    except _SdkExpired as e:
+        raise _TodusTokenExpired(str(e)) from e
+
+
+def _todus_resolve_sync(phone, token, url):
+    """Resuelve una URL corta de toDus a su URL real (todus:gurl)."""
+    from todus.errors import TokenExpiredError as _SdkExpired
+    client = _todus_make_client(phone)
+    try:
+        return client.get_real_download_url(token, url)
+    except _SdkExpired as e:
+        raise _TodusTokenExpired(str(e)) from e
+
+
+async def _todus_ensure_token(force=False):
+    """JWT válido de la cuenta configurada (None si no hay cuenta).
+
+    Reutiliza el JWT guardado mientras no conste caducado; si caducó
+    (o force=True), hace login con la contraseña y persiste el nuevo.
+    """
+    creds = _todus_creds_load()
+    if not creds.get("phone") or not creds.get("password"):
+        return None
+
+    def _usable(c):
+        jwt = c.get("jwt") or ""
+        if not jwt or force:
+            return ""
+        exp = c.get("jwt_exp") or _jwt_exp(jwt)
+        # Sin exp conocido se fía del JWT hasta que el servidor lo
+        # rechace (entonces el caller reintenta con force=True).
+        return jwt if (not exp or exp - time.time() > 300) else ""
+
+    jwt = _usable(creds)
+    if jwt:
+        return jwt
+    async with _todus_lock:
+        creds = _todus_creds_load()
+        jwt = _usable(creds)
+        if jwt:
+            return jwt
+        phone_n, jwt = await asyncio.to_thread(
+            _todus_login_sync, creds["phone"], creds["password"])
+        creds["phone"] = phone_n or creds["phone"]
+        creds["jwt"] = jwt
+        creds["jwt_exp"] = _jwt_exp(jwt)
+        _todus_creds_save()
+        log.info("ToDus: login OK (JWT renovado)")
+        return jwt
+
+
+# FileType del protocolo toDus según extensión (0=FILE 1=VOICE 2=AUDIO
+# 3=VIDEO 4=PICTURE 5=PROFILE; ver todus.types.FileType).
+_TODUS_TYPE_BY_EXT = {
+    ".opus": 1,
+    ".mp3": 2, ".m4a": 2, ".aac": 2, ".flac": 2, ".wav": 2, ".ogg": 2,
+    ".mp4": 3, ".mkv": 3, ".mov": 3, ".webm": 3, ".avi": 3, ".m4v": 3,
+    ".jpg": 4, ".jpeg": 4, ".png": 4, ".gif": 4, ".webp": 4, ".bmp": 4,
+}
+
+
+def _todus_file_type(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    return _TODUS_TYPE_BY_EXT.get(ext, 0)
+
+
+async def _put_presigned(temp_path, url, size):
+    """PUT en streaming a la URL prefirmada que asignó el servidor.
+
+    Igual que la app oficial (y que ToDusFileMixin.upload_file):
+    Content-Type application/octet-stream y Content-Length exacto.
+    NO se añaden Content-Disposition ni Content-Type real: en una URL
+    prefirmada, cabeceras no contempladas pueden romper la firma.
+    """
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+    }
+    timeout = aiohttp.ClientTimeout(
+        total=None, connect=30, sock_connect=30, sock_read=600
+    )
+    f = open(temp_path, "rb")
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.put(url, data=f, headers=headers) as resp:
+                if resp.status in (200, 201, 204):
+                    body = await resp.text()
+                    if "<Error>" in body:
+                        raise _S3RetryableError(
+                            f"el PUT oficial devolvió un error con HTTP "
+                            f"{resp.status}: {body[:200].strip()}"
+                        )
+                    return
+                detail = (await resp.text())[:200].strip()
+                if resp.status >= 500:
+                    raise _S3RetryableError(
+                        f"PUT oficial HTTP {resp.status}: {detail}")
+                raise RuntimeError(
+                    f"PUT oficial rechazado (HTTP {resp.status}): {detail}")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+        raise _S3RetryableError(f"error de red en el PUT oficial: {e}") from e
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+async def _verify_official_url(url, size):
+    """Verifica la URL de descarga oficial con GET Range bytes=0-0.
+
+    Nunca HEAD: una URL prefirmada para GET puede rechazarlo por la
+    firma. Devuelve (estado, detalle) como _verify_s3_object, pero
+    aquí solo 404/410 confirmado (o tamaño distinto) cuenta como
+    muerto; cualquier otra cosa es "unverifiable" (el PUT aceptado
+    por el servidor ya es buena señal: no tumbar la entrega).
+    """
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    headers = {
+        "User-Agent": _S3_USER_AGENT,
+        "Range": "bytes=0-0",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+    }
+    last = "sin respuesta"
+    saw_404 = False
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(3):
+                try:
+                    async with session.get(url, headers=headers,
+                                           allow_redirects=True) as resp:
+                        if resp.status in (200, 206):
+                            remote = _remote_size(resp.headers)
+                            if remote and size and remote != size:
+                                return "dead", (
+                                    f"tamaño remoto {format_size(remote)} "
+                                    f"!= esperado {format_size(size)}")
+                            return "ok", f"HTTP {resp.status}"
+                        if resp.status in (404, 410):
+                            saw_404 = True
+                            last = f"HTTP {resp.status}"
+                        else:
+                            return "unverifiable", f"HTTP {resp.status}"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last = f"error de red: {e}"
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+    except Exception as e:
+        return "unverifiable", str(e)[:120]
+    return ("dead", last) if saw_404 else ("unverifiable", last)
+
+
+async def _todus_reserve(phone, token, size, ftype, filename):
+    """Reserva con re-login si el token caducó. Devuelve (put, get, token).
+
+    Si TODUS_PERSISTENT está activo se pide primero persistent=true y,
+    si el servidor lo rechaza, se cae solo a persistent=false.
+    """
+    persistents = [True, False] if TODUS_PERSISTENT else [False]
+    last_err = None
+    for persistent in persistents:
+        for _try in range(2):
+            try:
+                put, get = await asyncio.to_thread(
+                    _todus_reserve_sync, phone, token, size, ftype,
+                    filename, persistent)
+                log.info(f"ToDus: reserva OK (persistent={persistent})")
+                return put, get, token
+            except _TodusTokenExpired:
+                log.warning("ToDus: token caducado en la reserva; re-login")
+                token = await _todus_ensure_token(force=True)
+                if not token:
+                    raise RuntimeError("sin sesión de toDus (re-login falló)")
+            except Exception as e:
+                last_err = e
+                log.warning(
+                    f"ToDus: reserva (persistent={persistent}) falló: {e}")
+                break
+    raise RuntimeError(f"reserva de toDus falló: {last_err}")
+
+
+async def _upload_official(temp_path, filename, size, status_cb=None):
+    """Sube por el flujo oficial y devuelve la URL de descarga.
+
+    Lanza excepción ante cualquier fallo: subir_a_s3 decide entonces
+    caer a la vía anónima adaptativa.
+    """
+    token = await _todus_ensure_token()
+    if not token:
+        raise RuntimeError(
+            "cuenta de toDus no configurada (usa /toduslogin o "
+            "TODUS_PHONE/TODUS_PASSWORD)")
+    phone = _todus_creds_load().get("phone") or ""
+    ftype = _todus_file_type(filename)
+
+    async def _notify(step):
+        if status_cb:
+            try:
+                await status_cb(_render_status_progress(step, filename, size))
+            except Exception:
+                pass
+
+    await _notify("uploading")
+    put_url, get_url, token = await _todus_reserve(
+        phone, token, size, ftype, filename)
+    log.info(f"ToDus: put={put_url[:90]} get={get_url[:90]}")
+
+    # PUT a la URL asignada. Los 5xx/red reintentan con la misma URL;
+    # un 4xx suele ser firma caducada/rechazada: se vuelve a reservar.
+    last_err = None
+    try:
+        async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
+            for attempt in range(1, S3_UPLOAD_RETRIES + 1):
+                try:
+                    await _put_presigned(temp_path, put_url, size)
+                    last_err = None
+                    break
+                except _S3RetryableError as e:
+                    last_err = e
+                    log.warning(f"ToDus: PUT intento {attempt} falló: {e}")
+                    if attempt < S3_UPLOAD_RETRIES:
+                        await asyncio.sleep(min(2 ** attempt, 16))
+                except RuntimeError as e:
+                    last_err = e
+                    if attempt < S3_UPLOAD_RETRIES:
+                        log.warning(
+                            f"ToDus: PUT rechazado ({e}); re-reservando")
+                        put_url, get_url, token = await _todus_reserve(
+                            phone, token, size, ftype, filename)
+                        await asyncio.sleep(1)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise RuntimeError(
+            f"tiempo agotado ({S3_UPLOAD_TIMEOUT}s) en la subida oficial")
+    if last_err is not None:
+        raise RuntimeError(f"PUT oficial falló: {last_err}")
+    log.info("ToDus: PUT oficial OK")
+
+    # URL de descarga: si es la corta (todus.cu/...), se resuelve a la
+    # real vía todus:gurl; si ya es una URL de objeto, va tal cual.
+    deliver = get_url
+    if (urlparse(get_url).hostname or "").lower() == "todus.cu":
+        for _try in range(2):
+            try:
+                resolved = await asyncio.to_thread(
+                    _todus_resolve_sync, phone, token, get_url)
+                if resolved:
+                    deliver = resolved
+                break
+            except _TodusTokenExpired:
+                token = await _todus_ensure_token(force=True)
+                if not token:
+                    break
+            except Exception as e:
+                log.warning(
+                    f"ToDus: no se pudo resolver la URL corta ({e}); "
+                    "se entrega tal cual")
+                break
+
+    await _notify("verifying")
+    state, detail = await _verify_official_url(deliver, size)
+    if state == "dead":
+        raise RuntimeError(
+            f"la URL oficial no responde ({detail}): {deliver[:90]}")
+    if state == "unverifiable":
+        log.warning(
+            f"ToDus: URL oficial no verificable ({detail}); se entrega "
+            "porque el servidor aceptó el PUT")
+    return deliver
+
+
 async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
     """Sube el archivo a S3 y devuelve (url_principal, [urls_espejo]).
 
@@ -1113,6 +1641,11 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
 
     Solo si ningún namespace consigue dejar el archivo vivo se lanza
     RuntimeError (mejor un error honesto que un ✓ con enlaces muertos).
+
+    Si hay cuenta de toDus configurada, ANTES se intenta la vía
+    oficial (_upload_official: reserva todus:purl + PUT a la URL que
+    asigna el servidor, objeto registrado fuera del barrido). Todo lo
+    anterior queda entonces como respaldo automático.
     """
     actual_size = os.path.getsize(temp_path)
     if size and size != actual_size:
@@ -1120,6 +1653,33 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None):
             f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
         )
     size = actual_size
+
+    # --- Vía oficial de toDus (ToDus-SDK) si hay cuenta ---
+    # Cualquier fallo cae a la vía anónima adaptativa de abajo: la
+    # subida nunca se pierde porque el SDK o la sesión fallen.
+    if _todus_official_enabled():
+        try:
+            url = await _upload_official(
+                temp_path, filename, size, status_cb)
+            mirrors = []
+            if TODUS_ANON_MIRROR and S3_UNSIGNED:
+                try:
+                    pfx = _ns_candidates()[0]
+                    mkey = build_s3_key(user_id, filename, pfx)
+                    murl = s3_public_url(mkey)
+                    await _upload_and_verify(
+                        temp_path, mkey, murl, filename, size)
+                    mirrors = [murl]
+                except Exception as e:
+                    log.warning(
+                        f"ToDus: espejo anónimo falló (se ignora): {e}")
+            log.info(
+                f"ToDus oficial OK final: principal={url} espejos={mirrors}")
+            return url, mirrors
+        except Exception as e:
+            log.warning(
+                f"ToDus oficial falló ({e}); se cae a la vía anónima "
+                "adaptativa")
 
     mirrors = S3_MIRRORS if S3_UNSIGNED else 1
     settle = S3_SETTLE_SECONDS if (S3_UNSIGNED and S3_VERIFY_UPLOAD) else 0
@@ -1790,6 +2350,136 @@ _sendfile_users = set()
 # Usuarios que han activado /udyat (recibir el manifiesto .udyat para
 # descargar sin gastar megas vía IroS3Dl).
 _udyat_users = set()
+# Login de toDus en curso esperando el código SMS:
+# user_id -> {"phone": str (normalizado), "ts": float}
+_todus_pending_login = {}
+
+
+def _is_admin(user_id):
+    """¿Puede gestionar la cuenta de toDus del bot (/toduslogin...)?
+
+    En modo userbot, solo el dueño de la cuenta. En modo bot, solo los
+    IDs de ADMIN_TG_IDS. Sin ninguna de las dos cosas devuelve False:
+    el login interactivo queda deshabilitado (usar las env
+    TODUS_PHONE/TODUS_PASSWORD).
+    """
+    if user_id is None:
+        return False
+    if _is_userbot_mode and _tg_owner_id is not None:
+        return user_id == _tg_owner_id
+    return ADMIN_TG_IDS is not None and user_id in ADMIN_TG_IDS
+
+
+async def _todus_finish_login(event, sender_id, phone, code):
+    """Completa el registro SMS: valida el código, hace login y guarda."""
+    try:
+        phone_n, password = await asyncio.to_thread(
+            _todus_validate_code_sync, phone, code)
+        phone_n, jwt = await asyncio.to_thread(
+            _todus_login_sync, phone_n, password)
+    except Exception as e:
+        await event.respond(
+            f"{ICON_ERROR} El código no validó: {str(e)[:180]}\n"
+            "Revisa el código e inténtalo de nuevo, o /toduslogin "
+            "NÚMERO para pedir otro.")
+        return
+    _todus_pending_login.pop(sender_id, None)
+    _todus_creds_load()
+    _todus_creds.update(
+        phone=phone_n, password=password, jwt=jwt, jwt_exp=_jwt_exp(jwt))
+    _todus_creds_save()
+    log.info(f"ToDus: login por SMS completado ({_mask_phone(phone_n)})")
+    await event.respond(
+        f"{ICON_DONE} Sesión de toDus iniciada ({_mask_phone(phone_n)}).\n\n"
+        "A partir de ahora las subidas usan la vía oficial (el servidor "
+        "asigna el enlace: queda fuera del barrido de anónimos). Si la "
+        "vía oficial falla, el bot cae solo a la anterior.\n"
+        "Estado cuando quieras: /todusstatus")
+
+
+async def _todus_password_login(event, phone, password):
+    """Login directo con contraseña ya conocida de la cuenta."""
+    try:
+        phone_n, jwt = await asyncio.to_thread(
+            _todus_login_sync, phone, password)
+    except Exception as e:
+        await event.respond(f"{ICON_ERROR} Login fallido: {str(e)[:180]}")
+        return
+    _todus_creds_load()
+    _todus_creds.update(
+        phone=phone_n, password=password, jwt=jwt, jwt_exp=_jwt_exp(jwt))
+    _todus_creds_save()
+    log.info(f"ToDus: login con contraseña completado ({_mask_phone(phone_n)})")
+    await event.respond(
+        f"{ICON_DONE} Sesión de toDus iniciada ({_mask_phone(phone_n)}).\n"
+        "⚠️ Borra el mensaje con la contraseña: queda en el historial "
+        "del chat. La próxima vez basta el login automático.")
+
+
+async def _handle_todus_command(event, body, sender_id):
+    """Despacha /toduslogin, /toduscode, /todusstatus y /toduslogout.
+
+    Solo se llega aquí si _is_admin(sender_id) ya dio True.
+    """
+    parts = body.split()
+    cmd = parts[0].lower() if parts else ""
+    if cmd == "/todusstatus":
+        await event.respond(_render_todus_status())
+        return
+    if cmd == "/toduslogout":
+        _todus_creds_clear()
+        _todus_pending_login.pop(sender_id, None)
+        await event.respond(
+            f"{ICON_DONE} Sesión de toDus cerrada.\n\n"
+            "Las próximas subidas usarán la vía anónima (salvo que "
+            "estén definidas TODUS_PHONE/TODUS_PASSWORD por entorno).")
+        return
+    if cmd == "/toduslogin":
+        if len(parts) == 2:
+            try:
+                phone_n = await asyncio.to_thread(
+                    _todus_request_code_sync, parts[1].strip())
+            except Exception as e:
+                await event.respond(
+                    f"{ICON_ERROR} No se pudo pedir el código SMS: "
+                    f"{str(e)[:180]}")
+                return
+            _todus_pending_login[sender_id] = {
+                "phone": phone_n, "ts": time.time()}
+            await event.respond(
+                "📩 Código SMS enviado. Respóndeme con el código de 6 "
+                "dígitos (o usa /toduscode 123456). Caduca en 5 minutos.")
+            return
+        if len(parts) == 3:
+            await _todus_password_login(
+                event, parts[1].strip(), parts[2].strip())
+            return
+        await event.respond(
+            "Uso: /toduslogin NÚMERO (login por SMS) o /toduslogin "
+            "NÚMERO CONTRASEÑA si ya tienes la contraseña de la cuenta.")
+        return
+    if cmd == "/toduscode":
+        pend = _todus_pending_login.get(sender_id)
+        if not pend:
+            await event.respond(
+                f"{ICON_ERROR} No hay login SMS en curso. "
+                "Empieza con /toduslogin NÚMERO.")
+            return
+        if time.time() - pend["ts"] > 300:
+            _todus_pending_login.pop(sender_id, None)
+            await event.respond(
+                f"{ICON_ERROR} El código caducó (5 min). "
+                "Vuelve a empezar con /toduslogin.")
+            return
+        if len(parts) != 2 or not parts[1].isdigit():
+            await event.respond("Uso: /toduscode 123456")
+            return
+        await _todus_finish_login(
+            event, sender_id, pend["phone"], parts[1].strip())
+        return
+    await event.respond(
+        "Comandos de toDus: /toduslogin · /toduscode · "
+        "/todusstatus · /toduslogout")
 
 
 async def on_tg_message(event):
@@ -1831,7 +2521,7 @@ async def on_tg_message(event):
         low = body.lower() if body else ""
 
         if low in ("/start", "hola", "ayuda", "help", "/help"):
-            await event.respond(_render_help(is_userbot=_is_userbot_mode))
+            await event.respond(_render_help(is_userbot=_is_userbot_mode, is_admin=_is_admin(sender_id)))
             return
 
         if low in ("/cancel", "cancelar"):
@@ -1872,6 +2562,33 @@ async def on_tg_message(event):
                 _udyat_users.add(sender_id)
                 await event.respond(_render_udyat_state(enabled=True))
             return
+
+        # ===== CUENTA DE TODUS (solo admin) =====
+        if low.startswith(("/toduslogin", "/toduscode")) or low in (
+                "/todusstatus", "/toduslogout"):
+            if not _is_admin(sender_id):
+                await event.respond(
+                    f"{ICON_ERROR} Solo el administrador del bot puede "
+                    "gestionar la cuenta de toDus.")
+                return
+            await _handle_todus_command(event, body, sender_id)
+            return
+
+        # Código SMS "suelto" mientras hay un login en curso: se
+        # captura aquí para no obligar a escribir /toduscode.
+        _pend = _todus_pending_login.get(sender_id)
+        if _pend and _is_admin(sender_id):
+            _code = body.replace(" ", "").strip()
+            if _code.isdigit() and 4 <= len(_code) <= 8:
+                if time.time() - _pend["ts"] <= 300:
+                    await _todus_finish_login(
+                        event, sender_id, _pend["phone"], _code)
+                else:
+                    _todus_pending_login.pop(sender_id, None)
+                    await event.respond(
+                        f"{ICON_ERROR} El código caducó (5 min). "
+                        "Vuelve a empezar con /toduslogin.")
+                return
 
         # ===== DETECCIÓN DE MEDIA REENVIADA =====
         if event.message and event.message.media:

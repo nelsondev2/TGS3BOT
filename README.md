@@ -11,6 +11,7 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 - ✅ **Event loop no bloqueado**: llamadas síncronas envueltas en `asyncio.to_thread`
 - ✅ **Subida a toDus resistente al barrido**: PUT directo en una sola petición (sin multipart de boto3) y espejos en varios namespaces. Medido en vivo con `scripts/probe_todus.py` (26-27 oct): el bucket barre namespaces enteros sin aviso (la raíz y `users/tg_*` en <2 min; `dk/` cayó de un día para otro; `users/df/` pasó a morir a los 10-18 min; `hi/` es hoy el refugio más sólido) — eso era lo que hacía que los enlaces vencieran casi al instante
 - ✅ **Verificación + espera anti-barrido + memoria**: el enlace se entrega solo tras comprobar con HEAD (antes y después de una espera de 150 s) que el objeto sigue vivo; si desaparece, cae automáticamente al siguiente namespace y recuerda cuál sobrevivió. Se entrega **enlace principal + espejo** en otro namespace; nunca se entrega un enlace muerto como ✓
+- 📲 **Subida OFICIAL a toDus (ToDus-SDK)**: con una cuenta de toDus (login desde el propio bot con `/toduslogin` por SMS), cada subida se **reserva** en el servidor (`todus:purl`, como la app oficial) y el objeto queda registrado fuera del barrido de anónimos. Si la vía oficial falla, cae sola a la anónima adaptativa. Es la respuesta a que hasta `hi/` acabara venciendo
 - 🆓 **Descarga sin megas (Cuba)**: con `/udyat` el bot envía además un manifiesto `.udyat` para la app IroS3Dl que apunta a la IP gratuita de toDus (`152.207.206.86`); la ayuda del bot trae también la receta manual para 1DM+ (cabeceras UDYAT)
 - ✅ **Descarga paralela robusta**: rechaza respuestas `200 OK` en peticiones `Range`
 - ✅ **Detección de extensión desde `Content-Type`** cuando la URL no la tiene
@@ -140,6 +141,12 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). Cambiar a `1` para reenviar archivo. Los usuarios pueden opt-in con `/sendfile` |
 | `SEND_UDYAT_VIA_TG` | `1` | Permite enviar el manifiesto `.udyat` (descarga sin megas en Cuba) a quien lo active con `/udyat`. Solo aplica si el S3 es `s3.todus.cu`. `0` desactiva la función |
 | `UDYAT_FREE_IP` | `152.207.206.86` | IP gratuita de toDus escrita en el manifiesto `.udyat` (respaldo conocido: `152.207.206.88`) |
+| `TODUS_UPLOAD_MODE` | `auto` | `auto` = vía oficial si hay cuenta de toDus (y anónima si no la hay o si la oficial falla). `official` = como `auto` (el fallback se mantiene por resiliencia). `anonymous` = nunca usar el SDK (comportamiento anterior) |
+| `TODUS_PHONE` | *(vacío)* | Número cubano (53XXXXXXXX) de la cuenta de toDus del bot. Opcional si haces login con `/toduslogin`; si está definida, manda sobre el número guardado |
+| `TODUS_PASSWORD` | *(vacío)* | Contraseña/secreto (96 hex) de esa cuenta. Opcional: `/toduslogin` la obtiene por SMS y la guarda en `todus_credentials.json` |
+| `TODUS_PERSISTENT` | `1` | Pedir la reserva `todus:purl` como persistente (`persistent=true`); si el servidor la rechaza, reintenta solo con `persistent=false` (modo "chat" de la app) |
+| `TODUS_ANON_MIRROR` | `0` | `1` = tras una subida oficial OK, subir además una copia anónima como espejo (doble subida; por defecto no) |
+| `ADMIN_TG_IDS` | *(vacío)* | CSV de IDs de Telegram que pueden usar `/toduslogin` y compañía en **modo bot**. En modo userbot no hace falta (solo el dueño). Sin esto, el login interactivo queda deshabilitado en modo bot (usar `TODUS_PHONE`/`TODUS_PASSWORD`) |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `S3_ENDPOINT` | `https://s3.todus.cu` | Endpoint S3 |
 | `S3_BUCKET` | `stream` | Bucket S3 |
@@ -166,6 +173,10 @@ Ver `.env.example` para referencia.
 | `/status` | Verifica si tienes trabajo en curso |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
 | `/udyat` (alias `/sinmegas`) | Toggle: recibir también el manifiesto `.udyat` para descargar sin gastar megas en Cuba (IroS3Dl) — por defecto OFF |
+| `/toduslogin <número>` | *(solo admin)* Login de la cuenta de toDus del bot por SMS (o `/toduslogin <número> <contraseña>`) |
+| `/toduscode <código>` | *(solo admin)* Completa el login por SMS (o responde solo con el código) |
+| `/todusstatus` | *(solo admin)* Estado de la sesión de toDus |
+| `/toduslogout` | *(solo admin)* Cierra la sesión de toDus (vuelve a la vía anónima) |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
 | `<URL>` | Procesa cualquier URL http/https |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3 |
@@ -188,6 +199,27 @@ El servidor `s3.todus.cu` responde también en una **IP interna que ETECSA no fa
 - **1DM+ (manual):** 1DM+ admite cabeceras personalizadas por descarga. Añade una descarga con el enlace del bot **cambiando el host** por la IP: `https://152.207.206.86/stream/...`, y en las cabeceras (headers) de esa descarga pon `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`. Si la app avisa del certificado (esa IP usa uno self-signed), acéptalo para continuar.
 
 > ⚠️ Esto solo funciona desde la red cubana de ETECSA. Verifica la primera vez con un archivo pequeño y comprueba el saldo antes/después: que salga a 0 MB depende de cómo ETECSA clasifique esa IP, y la IP puede cambiar (ajústala con `UDYAT_FREE_IP`; respaldo conocido: `152.207.206.88`).
+
+### Subida oficial con cuenta de toDus (ToDus-SDK) — la vía que no vence
+
+La vía anónima depende de que el servidor respete algún *namespace*, y toDus rota las reglas sin aviso: `dk/` cayó en un día, `users/df/` pasó a morir a los 10-18 min y hasta `hi/` acabó venciendo. La vía con garantías es la de la **app oficial**: antes de subir, el cliente **reserva** la subida por XMPP (`todus:purl`) con una cuenta de toDus; el servidor asigna las URLs de subida/descarga y el objeto queda **registrado** a nombre de la cuenta, fuera del barrido de objetos anónimos. El bot lo hace con [ToDus-SDK](https://github.com/nyxthor-dev/toDus-SDK) y el login se hace **desde el propio bot**:
+
+**Activarlo (una sola vez):**
+1. En **modo bot**, define `ADMIN_TG_IDS` con tu ID de Telegram (solo esos IDs pueden gestionar la cuenta; en modo userbot no hace falta: solo el dueño).
+2. Escríbele al bot `/toduslogin 53XXXXXXXX` con un número cubano que controles: toDus enviará un **SMS con un código** a ese número.
+3. Responde al bot con el código (o `/toduscode 123456`). El bot registra la cuenta, guarda la contraseña que devuelve el servidor en `DOWNLOAD_PATH/todus_credentials.json` (permisos 0600) y queda logueado.
+4. Sube algo: en los logs verás `ToDus: reserva OK (persistent=True)` y las URLs asignadas por el servidor.
+
+Alternativa sin pasar por Telegram: define `TODUS_PHONE` y `TODUS_PASSWORD` en el entorno. Con `/todusstatus` ves el estado de la sesión y con `/toduslogout` la cierras (vuelve la vía anónima).
+
+**Cómo se comporta:**
+- Pide la reserva con `persistent=true`; si el servidor la rechaza, reintenta con `persistent=false` (el modo "chat" de la app). Se puede forzar con `TODUS_PERSISTENT=0`.
+- El PUT va en streaming a la URL asignada, como la app (`application/octet-stream`, longitud exacta); si la URL prefirmada caduca (4xx) se vuelve a reservar. La URL de descarga se verifica antes de entregarla (GET con Range, porque un HEAD puede romper la firma de una URL prefirmada para GET) y las URLs cortas `todus.cu/...` se resuelven a la real.
+- El JWT se renueva solo cuando caduca, con la contraseña guardada.
+- **Fallback total:** si cualquier paso oficial falla (sin red hacia toDus, sesión rechazada, SDK caído…), la subida cae automáticamente a la vía anónima adaptativa de siempre. Nunca se pierde una subida por el SDK.
+- En Render, las credenciales sobreviven a los redespliegues solo si `DOWNLOAD_PATH` está en el disco (el `render.yaml` incluido monta uno en `/tmp/tg_uploads`); si no, repite el login o usa las variables de entorno.
+
+**Seguridad:** el login usa el flujo *legítimo* de la app (SMS a tu número o tu contraseña). El SDK también documenta `login_with_phone_only`, que explota que `/v2/auth/token` acepta cualquier UUID como "contraseña" para entrar como **cualquier** número: es un bypass de autenticación del servidor y en este bot **no se usa** — todo pasa por una cuenta tuya de verdad.
 
 ## 🎨 Interfaz minimalista
 
@@ -328,7 +360,7 @@ El watchdog reinicia el proceso cada `WATCHDOG_LIFETIME` segundos (default: 3h 5
 ### Sobre el S3
 El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cambiarlo a cualquier S3 compatible (AWS, MinIO, Cloudflare R2, etc.) seteando `S3_ENDPOINT`, `S3_BUCKET`, `S3_UNSIGNED=0`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`.
 
-**Ojo con la permanencia en toDus:** el bucket `stream` tiene un barrido activo cuyas reglas CAMBIAN sin aviso (medido con `scripts/probe_todus.py` el 26-27 oct 2026): la raíz, `users/tg_*` y `video/` mueren en <2 min; `dk/` era refugio un día y amaneció vacío al siguiente; `users/df/` pasó de refugio a morir a los 10-18 min; `hi/` es hoy lo más sólido (objetos de ~16 h). Por eso el bot ya no se casa con un namespace: sube a 2 namespaces (principal + espejo, hoy `hi/` + `users/df/`), espera 150 s para confirmar que sobreviven al barrido rápido antes de entregar los enlaces, y recuerda cuál sobrevivió para usarlo primero la próxima vez. Aun así, el bucket es público y anónimo también para borrar: ningún cliente puede hacer permanentes los enlaces en un bucket ajeno. Descarga pronto; para permanencia real usa tu propio S3 (`S3_UNSIGNED=0`) o, en el futuro, el flujo oficial de toDus con cuenta propia (reserva XMPP `todus:purl`, ver [ToDus-SDK](https://github.com/nyxthor-dev/toDus-SDK)). Si los enlaces volvieran a caer, re-mide con `scripts/probe_todus.py` y ajusta `S3_KEY_PREFIXES`.
+**Ojo con la permanencia en toDus:** el bucket `stream` tiene un barrido activo cuyas reglas CAMBIAN sin aviso (medido con `scripts/probe_todus.py` el 26-27 oct 2026): la raíz, `users/tg_*` y `video/` mueren en <2 min; `dk/` era refugio un día y amaneció vacío al siguiente; `users/df/` pasó de refugio a morir a los 10-18 min; `hi/` aguantó más (objetos de ~16 h el 27-oct) pero también acabó cayendo poco después. Por eso el bot ya no se casa con un namespace: sube a 2 namespaces (principal + espejo, hoy `hi/` + `users/df/`), espera 150 s para confirmar que sobreviven al barrido rápido antes de entregar los enlaces, y recuerda cuál sobrevivió para usarlo primero la próxima vez. Aun así, el bucket es público y anónimo también para borrar: ningún cliente puede hacer permanentes los enlaces en un bucket ajeno. Descarga pronto; para permanencia real usa tu propio S3 (`S3_UNSIGNED=0`) o activa la **vía oficial** con tu cuenta de toDus (`/toduslogin`, ver «Subida oficial con cuenta de toDus» más arriba), que es la que usa la app y no depende del barrido. Si los enlaces volvieran a caer, re-mide con `scripts/probe_todus.py` y ajusta `S3_KEY_PREFIXES`.
 
 ### Sobre el disco
 - `/tmp/tg_uploads` es efímero en Render (se pierde en cada deploy).
@@ -353,6 +385,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 14. Keys fuera de los namespaces que respeta el barrido de toDus (raíz en v1 y `users/tg_<id>/telegram/...` en v2: ambas eliminadas en <2 min aunque el PUT y la verificación inmediata fueran correctos — medido con `scripts/probe_todus.py`) → keys `users/df/<id>/...`
 15. La URL S3 se entregaba sin comprobar que el objeto existiera → verificación HEAD + tamaño con re-subida automática
 16. El fix de namespace fijo (`users/df/`) dejó de bastar en 24 h: toDus cambió el barrido y `users/df/` pasó a morir a los 10-18 min (y `dk/`, refugio el día anterior, a <2 min) → subida adaptativa: candidatos `S3_KEY_PREFIXES` con `hi/` primero, espejo en 2 namespaces, espera anti-barrido de 150 s antes de entregar y memoria persistente del namespace que sobrevive
+17. Ni la subida adaptativa bastó a la larga: el barrido rotó otra vez, tumbó también `hi/` y los enlaces volvieron a vencer → **vía oficial con ToDus-SDK**: reserva `todus:purl` con cuenta propia (login por SMS desde el bot con `/toduslogin`, solo admin), PUT a la URL que asigna el servidor, JWT auto-renovable y caída automática a la vía anónima si algo falla
 
 ## 🆘 Troubleshooting
 
@@ -365,6 +398,8 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 2. Sube a **2 namespaces candidatos** (`S3_KEY_PREFIXES`, por defecto `hi` → `users/df` → `dk/tg_{user_id}`) y espera **`S3_SETTLE_SECONDS` (150 s)** para re-verificar que siguen vivos *antes* de entregar nada.
 3. Entrega **enlace principal + espejo** en otro namespace: si un barrido lento tumba uno horas después, el otro puede seguir vivo. La tarjeta de resultado muestra ambos.
 4. Si un namespace muere, queda relegado al final y el superviviente pasa a ser el primero (memoria en `s3_namespace_state.json`): el bot se re-adapta solo cuando toDus cambia las reglas. Solo si *ningún* namespace deja el archivo vivo verás un error honesto en vez de enlaces muertos.
+
+**Actualización — la vía que ya no depende del barrido:** lo adaptativo de arriba sigue siendo el respaldo automático, pero incluso `hi/` terminó cayendo. Por eso el bot ahora intenta primero la **vía oficial** con una cuenta de toDus (reserva `todus:purl` vía ToDus-SDK; login desde el bot con `/toduslogin`, ver la sección «Subida oficial con cuenta de toDus»). Si tus enlaces siguen venciendo, comprueba con `/todusstatus` que hay sesión y que los logs dicen `ToDus: reserva OK`: sin cuenta, ya ningún namespace anónimo es fiable.
 
 **¿Y los repos de referencia?** `miguelorlandos06/s3_bot` sube a la raíz del bucket (`<uuid>_<nombre>`) sin verificar: sobre el barrido actual es el patrón que muere en <2 min, así que no es un modelo a seguir para esto. `nyxthor-dev/toDus-SDK` implementa el protocolo oficial de toDus y revela el mecanismo "correcto": la app reserva la subida por XMPP (`todus:purl`, con flag `persistent`) y el servidor asigna la URL — esos objetos quedan registrados y no dependen de adivinar namespaces. Es la vía con garantías a futuro, pero requiere una **cuenta de toDus** (número + contraseña) dedicada al bot. (El SDK también documenta `login_with_phone_only`, un bypass de autenticación del servidor: no se usa aquí.)
 
