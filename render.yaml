@@ -91,6 +91,28 @@ services:
         # IP gratuita de toDus escrita en el manifiesto. Puede cambiar;
         # respaldo conocido: 152.207.206.88
         value: "152.207.206.86"
+      # === ToDus oficial (ToDus-SDK) ===
+      # La vía anónima depende de namespaces que el barrido de toDus va
+      # tumbando sin aviso. La OFICIAL reserva cada subida con una
+      # cuenta de toDus (todus:purl) y el objeto queda registrado.
+      # Login desde el bot: /toduslogin (SMS). Las credenciales se
+      # guardan en el disco (DOWNLOAD_PATH/todus_credentials.json);
+      # si el disco no persiste, usa TODUS_PHONE/TODUS_PASSWORD.
+      - key: TODUS_UPLOAD_MODE
+        # auto = oficial si hay cuenta y anónima si no/falla | anonymous = nunca SDK
+        value: "auto"
+      - key: TODUS_PHONE
+        # Número cubano (53XXXXXXXX) de la cuenta de toDus del bot (opcional)
+        sync: false
+      - key: TODUS_PASSWORD
+        # Contraseña/secreto de esa cuenta (opcional; /toduslogin la obtiene por SMS)
+        sync: false
+      - key: TODUS_PERSISTENT
+        # "1" = pedir la reserva como persistente (cae solo a false si el server la rechaza)
+        value: "1"
+      - key: ADMIN_TG_IDS
+        # CSV de IDs que pueden usar /toduslogin en MODO BOT (en userbot, solo el dueño)
+        sync: false
     disk:
       # Disco efímero para descargas temporales
       name: tmp-downloads

@@ -11,5 +11,11 @@ boto3>=1.35.0
 aiohttp>=3.10.0
 aiofiles>=23.2.1
 
+# ToDus-SDK: flujo OFICIAL de subida a toDus (reserva todus:purl con
+# cuenta propia; login con /toduslogin). Pin EXACTO a propósito: para
+# pedir la reserva con persistent=true usamos internals del SDK
+# (_xmpp_session/_recv_all) que su API pública no expone.
+todus-sdk==1.10.2
+
 # Opcional: para generar SESSION_STRING si usas modo userbot
 # tgcrypto>=1.2.5  # acelera cifrado MTPROTO en sistemas con soporte AES-NI
