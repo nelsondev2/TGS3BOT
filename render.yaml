@@ -49,7 +49,8 @@ services:
         # el 2026-10-27): hi/ es hoy el más sólido, users/df/ muere a los
         # 10-18 min y dk/ cayó por completo. El bot sube a S3_MIRRORS de
         # ellos (principal + espejo) y recuerda cuál sobrevive.
-        # Keys resultantes: <prefijo>/<user_id>/<nombre>_<rand>.<ext>
+        # Keys resultantes: <prefijo>/<user_id>/<rand8>/<nombre legible>
+        # (la cola de la URL es el nombre: los gestores nombran bien)
         value: "hi,users/df,dk/tg_{user_id}"
       - key: S3_MIRRORS
         # A cuántos namespaces subir cada archivo (principal + espejos)
