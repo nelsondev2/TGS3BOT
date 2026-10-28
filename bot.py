@@ -43,6 +43,7 @@ import mimetypes
 import threading
 import socket
 import ipaddress
+import unicodedata
 from urllib.parse import urlparse, unquote, quote
 
 import aiofiles
@@ -950,38 +951,61 @@ def _content_disposition(filename):
         )
 
 
+def _key_tail_name(filename):
+    """Nombre legible para el ÚLTIMO segmento de la key.
+
+    Los gestores (1DM+/IDM al importar el enlaces.txt) sacan el
+    nombre de la descarga de la cola de la URL cuando no hay un
+    Content-Disposition útil, así que la cola debe ser el nombre del
+    archivo, no un `<stem>_<uuid>`. Se pliega a ASCII (NFKD sin
+    marcas: «vídeo» -> «video»), que es la forma de los objetos que
+    sobreviven en el bucket, y se capa la longitud conservando la
+    extensión. El nombre EXACTO (acentos incluidos) sigue viajando en
+    Content-Disposition y en el #filename= del enlaces.txt.
+    """
+    name = sanitize_filename(filename)
+    name = (
+        unicodedata.normalize("NFKD", name)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    name = re.sub(r"[^A-Za-z0-9._()-]+", "_", name).strip("._") \
+        or f"file_{int(time.time())}.bin"
+    if len(name) > 180:
+        stem, ext = os.path.splitext(name)
+        keep = max(20, 180 - len(ext))
+        name = (stem[:keep].rstrip("._") or "file") + ext
+    return name
+
+
 def build_s3_key(user_id, filename, prefix=None):
     """Key dentro de un namespace candidato:
 
-        <prefijo>/<user_id>/<stem>_<rand8><ext>
+        <prefijo>/<user_id>/<rand8>/<nombre legible>
         (hoy el primer candidato es hi: hi/<user_id>/...)
 
-    Es la forma exacta de los objetos que sobreviven horas en el
-    bucket (verificado en vivo con scripts/probe_todus.py). El sufijo
-    _<rand8> evita que dos subidas con el mismo nombre se sobrescriban
-    (los nombres con sufijos numéricos son habituales en el bucket y
-    también sobrevivieron al probe). El nombre de descarga real va en
-    Content-Disposition, así que el usuario conserva su nombre original.
-    El prefijo admite el placeholder {user_id} (ej. dk/tg_{user_id}).
+    El último segmento es el nombre (casi) original a propósito: es
+    de donde los gestores de descarga sacan el nombre al guardar (en
+    el ecosistema toDus los objetos que sobreviven tienen justo esta
+    forma: users/df/<id>/Cyberpunk_E01.mkv). La unicidad la da el
+    segmento <rand8> intermedio, para que dos subidas con el mismo
+    nombre no se sobrescriban. El nombre exacto además va en
+    Content-Disposition. El prefijo admite el placeholder {user_id}
+    (ej. dk/tg_{user_id}).
     """
-    safe_name = re.sub(
-        r"[^A-Za-z0-9._-]+", "_", sanitize_filename(filename)
-    ).strip("._") or f"file_{int(time.time())}.bin"
-    stem, ext = os.path.splitext(safe_name)
-    unique_name = (
-        f"{stem}_{uuid.uuid4().hex[:8]}{ext}" if stem else safe_name
-    )
+    tail = _key_tail_name(filename)
+    rand = uuid.uuid4().hex[:8]
     pfx = S3_KEY_PREFIX if prefix is None else prefix
     if not pfx:
         # Sin namespace: raíz del bucket (solo buckets propios; en
         # toDus el barrido lo eliminaría en minutos).
-        return unique_name
+        return f"{rand}/{tail}"
     uid = str(user_id) if user_id else "0"
     if "{user_id}" in pfx:
         base = pfx.replace("{user_id}", uid).strip("/")
     else:
         base = f"{pfx}/{uid}"
-    return f"{base}/{unique_name}"
+    return f"{base}/{rand}/{tail}"
 
 
 def s3_public_url(key):
@@ -1574,18 +1598,26 @@ def _todus_file_type(filename):
     return _TODUS_TYPE_BY_EXT.get(ext, 0)
 
 
-async def _put_presigned(temp_path, url, size, progress_cb=None):
+async def _put_presigned(temp_path, url, size, progress_cb=None,
+                         content_disposition=None):
     """PUT en streaming a la URL prefirmada que asignó el servidor.
 
-    Igual que la app oficial (y que ToDusFileMixin.upload_file):
-    Content-Type application/octet-stream y Content-Length exacto.
-    NO se añaden Content-Disposition ni Content-Type real: en una URL
-    prefirmada, cabeceras no contempladas pueden romper la firma.
+    Como la app oficial: Content-Type application/octet-stream y
+    Content-Length exacto. `content_disposition` es OPCIONAL y viene
+    de _upload_official: la URL get= de toDus es opaca (sin nombre ni
+    extensión), así que sin esta cabecera las descargas se guardarían
+    con esa cadena como nombre. Si el servidor la acepta en el PUT,
+    queda guardada y el GET la devuelve (nombre correcto en
+    gestores/navegador). Puede no estar entre las cabeceras firmadas
+    y el servidor rechazarla: por eso quien llama la intenta primero
+    y reintenta sin ella ante cualquier rechazo.
     """
     headers = {
         "Content-Type": "application/octet-stream",
         "Content-Length": str(size),
     }
+    if content_disposition:
+        headers["Content-Disposition"] = content_disposition
     timeout = aiohttp.ClientTimeout(
         total=None, connect=30, sock_connect=30, sock_read=600
     )
@@ -1649,6 +1681,10 @@ async def _verify_official_url(url, size):
                                 return "dead", (
                                     f"tamaño remoto {format_size(remote)} "
                                     f"!= esperado {format_size(size)}")
+                            log.info(
+                                "ToDus: GET de verificación "
+                                "Content-Disposition="
+                                f"{resp.headers.get('Content-Disposition')!r}")
                             return "ok", f"HTTP {resp.status}"
                         if resp.status in (404, 410):
                             saw_404 = True
@@ -1722,22 +1758,38 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
 
     # PUT a la URL asignada. Los 5xx/red reintentan con la misma URL;
     # un 4xx suele ser firma caducada/rechazada: se vuelve a reservar.
+    # Se intenta fijar Content-Disposition con el nombre original (la
+    # URL get= es opaca y los gestores nombrarían la descarga con esa
+    # cadena); ante cualquier rechazo se sigue sin ella, como siempre.
+    disp = _content_disposition(filename)
+    use_disp = True
     last_err = None
     try:
         async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
             for attempt in range(1, S3_UPLOAD_RETRIES + 1):
                 try:
-                    await _put_presigned(temp_path, put_url, size,
-                                         progress_cb)
+                    await _put_presigned(
+                        temp_path, put_url, size, progress_cb,
+                        content_disposition=disp if use_disp else None)
                     last_err = None
                     break
                 except _S3RetryableError as e:
                     last_err = e
+                    if use_disp:
+                        use_disp = False
+                        log.warning(
+                            "ToDus: PUT con Content-Disposition falló "
+                            f"({e}); se sigue sin ella")
                     log.warning(f"ToDus: PUT intento {attempt} falló: {e}")
                     if attempt < S3_UPLOAD_RETRIES:
                         await asyncio.sleep(min(2 ** attempt, 16))
                 except RuntimeError as e:
                     last_err = e
+                    if use_disp:
+                        use_disp = False
+                        log.warning(
+                            "ToDus: PUT con Content-Disposition "
+                            f"rechazado ({e}); se sigue sin ella")
                     if attempt < S3_UPLOAD_RETRIES:
                         log.warning(
                             f"ToDus: PUT rechazado ({e}); re-reservando")
@@ -1749,7 +1801,9 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
             f"tiempo agotado ({S3_UPLOAD_TIMEOUT}s) en la subida oficial")
     if last_err is not None:
         raise RuntimeError(f"PUT oficial falló: {last_err}")
-    log.info("ToDus: PUT oficial OK")
+    log.info(
+        "ToDus: PUT oficial OK "
+        f"({'Content-Disposition enviada' if use_disp else 'sin Content-Disposition'})")
 
     # URL de descarga: si es la corta (todus.cu/...), se resuelve a la
     # real vía todus:gurl; si ya es una URL de objeto, va tal cual.
@@ -2175,14 +2229,14 @@ def _build_idm_txt(results):
     cualquier línea extra (títulos, comentarios) puede crear descargas
     fantasma, así que el archivo lleva SOLO las URLs.
 
-    Cada línea termina en `#filename=<nombre>` (percent-encoded): es
-    el truco que documenta el propio 1DM+ (changelog 15.4: "add
-    #filename=filename at the end of the url") para que la descarga se
-    guarde con EXACTAMENTE ese nombre y no con el de la key S3
-    (`<stem>_<uuid8>` en la vía anónima; la que asigne toDus en la
-    oficial). El fragmento `#...` nunca viaja al servidor HTTP, así
-    que el GET es idéntico; si un gestor ignora el truco, sigue
-    mandando el Content-Disposition/la URL como siempre.
+    Cada línea termina en `#filename=<nombre>` (percent-encoded): el
+    truco que documenta 1DM+ (changelog 15.4) para nombrar la
+    descarga. En la práctica (verificado por el usuario) 1DM+/IDM al
+    importar nombran desde la COLA de la URL: por eso las keys de la
+    vía anónima terminan en el nombre legible (build_s3_key) y el PUT
+    oficial intenta fijar Content-Disposition; este fragmento queda
+    como tercer cinturón (nunca viaja al servidor HTTP: el GET es
+    idéntico).
     """
     lines = []
     for name, url in results:
