@@ -178,6 +178,22 @@ S3_SETTLE_SECONDS = int(os.environ.get("S3_SETTLE_SECONDS", "150") or "0")
 # enlace (más lento, máxima garantía previa).
 S3_DELIVER_FAST = os.environ.get("S3_DELIVER_FAST", "1") == "1"
 
+# Solape descarga→subida: la subida a S3 empieza mientras el archivo
+# aún se está descargando al servidor, leyendo el temporal a medida
+# que crece. El temporal siempre se escribe entero en disco, así que
+# si el solape falla por lo que sea se reintenta con la subida clásica
+# desde el archivo completo: el tiempo total pasa de bajar+subir a
+# ≈ max(bajar, subir), sin perder garantías. Requiere conocer el
+# tamaño de antemano (documentos de Telegram; URLs con Content-Length
+# y descarga secuencial); el resto sigue el camino clásico.
+# "0" = desactivado (descargar entero y luego subir, como antes).
+STREAM_OVERLAP = os.environ.get("STREAM_OVERLAP", "1") == "1"
+# Por debajo de este tamaño el solape no compensa su complejidad.
+STREAM_OVERLAP_MIN_SIZE = int(os.environ.get("STREAM_OVERLAP_MIN_MB", "4") or "4") * 1024 * 1024
+# Si la descarga no produce bytes nuevos en este tiempo, la subida
+# solapada en curso se aborta (se caerá al camino clásico).
+STREAM_STALL_SECONDS = int(os.environ.get("STREAM_STALL_SECONDS", "300") or "300")
+
 # --- Servidor ---
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -640,6 +656,25 @@ def _render_status_progress(step, filename=None, size=None, pct=None):
     return " ".join(parts)
 
 
+def _render_overlap_progress(down_step, filename, size, down_pct, up_pct):
+    """Estado combinado del solape: ambos frentes a la vez.
+
+    "⚡ Recibiendo 60% · Subiendo 55% <nombre> · <tamaño>" — un solo
+    mensaje, como el resto de estados, para que se vea que descarga y
+    subida avanzan EN PARALELO (y no que el bot está colgado).
+    """
+    verbs = {"receiving": "Recibiendo", "downloading": "Descargando"}
+    dverb = verbs.get(down_step, "Recibiendo")
+    d = f"{down_pct}%" if down_pct is not None else "…"
+    u = f"{up_pct}%" if up_pct is not None else "…"
+    parts = [f"{ICON_PROCESSING} ⚡ {dverb} {d} · Subiendo {u}"]
+    if filename:
+        parts.append(filename)
+    if size:
+        parts.append(f"· {format_size(size)}")
+    return " ".join(parts)
+
+
 def _render_error(msg):
     """Mensaje de error limpio."""
     return f"{ICON_ERROR} {msg}"
@@ -835,14 +870,16 @@ class _ThrottledProgress:
             pass
 
 
-def _start_put_progress(f, size, progress_cb):
-    """Tarea que reporta el % de un PUT sondeando la posición del file.
+def _start_put_progress(get_done, size, progress_cb):
+    """Tarea que reporta el % de un PUT sondeando los bytes enviados.
 
-    Se sondea `f.tell()` en vez de envolver el archivo: el cuerpo que
-    ve aiohttp sigue siendo el file REAL, así fija el Content-Length
-    por fstat y no usa chunked (que toDus no acepta en un PUT).
-    `progress_cb` es async fn(done, total). Devuelve la tarea o None;
-    quien llama la cancela al terminar el PUT.
+    `get_done` es un callable sin argumentos: la posición del file
+    (f.tell) o el contador del cuerpo «follow» del solape. Se sondea
+    en vez de envolver el cuerpo: lo que ve aiohttp sigue siendo el
+    file REAL (o el generador con Content-Length explícito), nunca
+    chunked, que toDus no acepta en un PUT. `progress_cb` es async
+    fn(done, total). Devuelve la tarea o None; quien llama la cancela
+    al terminar el PUT.
     """
     if progress_cb is None or not size:
         return None
@@ -851,7 +888,7 @@ def _start_put_progress(f, size, progress_cb):
         while True:
             await asyncio.sleep(1.5)
             try:
-                done = f.tell()
+                done = get_done()
             except Exception:
                 return
             try:
@@ -860,6 +897,136 @@ def _start_put_progress(f, size, progress_cb):
                 pass
 
     return asyncio.create_task(_poll())
+
+
+class _ProducerFailedError(RuntimeError):
+    """La descarga que alimenta una subida solapada falló (o el tamaño
+    final no coincide con el anunciado): esa subida no puede
+    completarse y no tiene sentido reintentarla tal cual. El
+    orquestador (_download_then_upload) cae entonces a la subida
+    clásica si la descarga sí terminó bien."""
+
+
+class _FollowSource:
+    """Puente descarga→subida del solape (STREAM_OVERLAP).
+
+    El productor (la descarga) escribe el temporal en disco como
+    siempre y llama a finish() al terminar; los consumidores (los PUT
+    a S3) leen el archivo MIENTRAS crece con _follow_body(). El disco
+    hace de buffer y de red de seguridad: si el solape falla, queda el
+    archivo completo para la subida clásica de siempre.
+    """
+
+    def __init__(self, path, expected_size):
+        self.path = path
+        self.expected = int(expected_size)
+        self._done = asyncio.Event()
+        self.error = None        # excepción del productor, si la hubo
+        self.final_size = None   # tamaño real al terminar el productor
+
+    @property
+    def done(self):
+        return self._done.is_set()
+
+    def broken(self):
+        """True si el productor ya terminó y el resultado no es el
+        anunciado (falló la descarga o el tamaño real difiere):
+        seguir (re)intentando subidas solapadas no tiene sentido."""
+        return self.done and (self.error is not None
+                              or self.final_size != self.expected)
+
+    def finish(self, error=None):
+        try:
+            self.final_size = os.path.getsize(self.path)
+        except OSError:
+            self.final_size = 0
+        self.error = error
+        self._done.set()
+
+    async def wait_done(self):
+        await self._done.wait()
+
+
+def _follow_precheck(follow):
+    """Antes de abrir un PUT solapado: si la descarga ya terminó mal,
+    fallar al instante sin gastar red en reintentos condenados."""
+    if follow is not None and follow.broken():
+        raise _ProducerFailedError(
+            "la descarga terminó mal; se abandona la subida solapada"
+            + (f": {follow.error}" if follow.error else
+               f" (tamaño {follow.final_size} != {follow.expected})"))
+
+
+def _follow_mismatch_detail(follow, size):
+    return (f"tamaño real {follow.final_size} != anunciado {size}"
+            + (f" (la descarga falló: {follow.error})"
+               if follow.error else ""))
+
+
+async def _follow_body(follow, size, cell):
+    """Cuerpo de PUT que sigue al temporal mientras crece.
+
+    Produce EXACTAMENTE `size` bytes (el Content-Length ya anunciado)
+    o explota: terminar antes «sin error» dejaría al servidor
+    esperando el resto del cuerpo (aiohttp no lo detecta; verificado).
+    Si el productor falla, si el tamaño real difiere del anunciado o
+    si la descarga se atasca (STREAM_STALL_SECONDS sin bytes nuevos),
+    se lanza _ProducerFailedError y aiohttp aborta la conexión: un
+    PutObject con el cuerpo truncado no se materializa en S3/MinIO.
+    `cell` es una lista [bytes_enviados] para el progreso.
+    """
+    offset = 0
+    f = None
+    last_data = time.monotonic()
+    try:
+        while offset < size:
+            try:
+                avail = os.path.getsize(follow.path)
+            except OSError:
+                avail = 0
+            if avail > offset:
+                if f is None:
+                    f = open(follow.path, "rb")
+                chunk = f.read(min(avail - offset, 256 * 1024,
+                                   size - offset))
+                if chunk:
+                    offset += len(chunk)
+                    cell[0] = offset
+                    last_data = time.monotonic()
+                    yield chunk
+                    continue
+            if follow.done:
+                break
+            if time.monotonic() - last_data > STREAM_STALL_SECONDS:
+                raise _ProducerFailedError(
+                    f"la descarga lleva {STREAM_STALL_SECONDS}s sin "
+                    "producir datos; subida solapada abortada")
+            await asyncio.sleep(0.2)
+        if offset < size:
+            # Productor terminado con el archivo corto.
+            raise _ProducerFailedError(
+                _follow_mismatch_detail(follow, size))
+        # offset == size: hay que confirmar que no vienen MÁS bytes
+        # detrás. Si el tamaño anunciado estaba mal por defecto (la
+        # descarga real es mayor), declarar éxito aquí subiría un
+        # archivo TRUNCADO como si estuviera completo.
+        if not follow.done:
+            try:
+                await asyncio.wait_for(follow.wait_done(),
+                                       STREAM_STALL_SECONDS)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise _ProducerFailedError(
+                    "la descarga no confirmó su fin tras alcanzar el "
+                    "tamaño anunciado")
+        if follow.broken():
+            raise _ProducerFailedError(
+                _follow_mismatch_detail(follow, size))
+    finally:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 # ============== S3 UPLOAD ==============
@@ -1066,13 +1233,21 @@ def _ns_reorder(winner=None, loser=None):
             pass
 
 
-async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None):
+async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None,
+                         follow=None):
     """Subida unsigned (toDus): UN solo PUT HTTP con el archivo en streaming.
 
     Es exactamente el método de todus-client y de los bots que funcionan
     contra s3.todus.cu. Sin multipart, sin firma, con Content-Type real y
     Content-Disposition para que la descarga conserve el nombre original.
+
+    Con `follow` (solape) el cuerpo es el generador que sigue al
+    temporal mientras la descarga lo escribe. El Content-Length va
+    explícito en las cabeceras, así que el formato en la red es
+    idéntico al del file object: sin Transfer-Encoding: chunked, que
+    los S3-compatibles no aceptan en un PutObject sin firmar.
     """
+    _follow_precheck(follow)
     url = s3_public_url(key)
     headers = {
         "Content-Type": _guess_content_type(filename),
@@ -1085,14 +1260,20 @@ async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None):
     timeout = aiohttp.ClientTimeout(
         total=None, connect=30, sock_connect=30, sock_read=600
     )
-    f = open(temp_path, "rb")
-    poll = _start_put_progress(f, size, progress_cb)
+    f = None
+    cell = [0]
+    if follow is not None:
+        data = _follow_body(follow, size, cell)
+        poll = _start_put_progress(lambda: cell[0], size, progress_cb)
+    else:
+        f = open(temp_path, "rb")
+        data = f
+        poll = _start_put_progress(f.tell, size, progress_cb)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Pasar el file object hace que aiohttp fije Content-Length y
-            # lea en streaming (sin Transfer-Encoding: chunked, que los
-            # S3-compatibles no aceptan en un PutObject sin firmar).
-            async with session.put(url, data=f, headers=headers) as resp:
+            # lea en streaming (sin Transfer-Encoding: chunked).
+            async with session.put(url, data=data, headers=headers) as resp:
                 if resp.status in (200, 201, 204):
                     # Un PutObject correcto devuelve cuerpo vacío. Algunos
                     # backends responden 200 con un <Error> XML dentro:
@@ -1103,6 +1284,10 @@ async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None):
                             f"S3 devolvió un error con HTTP {resp.status}: "
                             f"{body[:200].strip()}"
                         )
+                    if follow is not None and cell[0] != size:
+                        raise _S3RetryableError(
+                            "la subida solapada no envió el cuerpo "
+                            f"completo ({cell[0]}/{size} bytes)")
                     if not resp.headers.get("ETag"):
                         log.warning(
                             "S3: PUT %s sin ETag en la respuesta (%s); "
@@ -1123,14 +1308,20 @@ async def _s3_put_direct(temp_path, key, filename, size, progress_cb=None):
     finally:
         if poll is not None:
             poll.cancel()
-        try:
-            f.close()
-        except Exception:
-            pass
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
-async def _s3_put_signed(temp_path, key, filename, size, progress_cb=None):
+async def _s3_put_signed(temp_path, key, filename, size, progress_cb=None,
+                         follow=None):
     """Subida firmada (S3_UNSIGNED=0): boto3 en un hilo, como antes.
+
+    `follow` se acepta por simetría pero NO se usa: boto3 lee el
+    archivo tal cual está en disco; _upload_and_verify espera a que
+    la descarga termine antes de llegar aquí en modo solape.
 
     En un S3 de verdad (AWS/MinIO/R2) el multipart de boto3 es correcto;
     solo se corrigen Content-Type/Content-Disposition y la clasificación
@@ -1297,7 +1488,7 @@ async def _verify_s3_object(url, expected_size):
 
 
 async def _upload_and_verify(temp_path, key, url, filename, size,
-                               progress_cb=None):
+                               progress_cb=None, follow=None):
     """Sube a UNA key con reintentos y verifica que el objeto quedó.
 
     Devuelve None si el objeto quedó activo (o no verificable en un
@@ -1305,13 +1496,21 @@ async def _upload_and_verify(temp_path, key, url, filename, size,
     reintentos en este namespace; los errores 4xx definitivos del PUT
     se propagan como RuntimeError (fallar rápido, como siempre).
     """
+    if follow is not None and not S3_UNSIGNED:
+        # boto3 no puede seguir un archivo en crecimiento: se espera a
+        # que la descarga acabe y se sube clásico (solape desactivado
+        # en modo firmado, sin perder ninguna garantía).
+        await follow.wait_done()
+        _follow_precheck(follow)
+        follow = None
     put = _s3_put_direct if S3_UNSIGNED else _s3_put_signed
     last_error = "error desconocido"
     try:
         async with asyncio.timeout(S3_UPLOAD_TIMEOUT):
             for attempt in range(1, S3_UPLOAD_RETRIES + 1):
                 try:
-                    await put(temp_path, key, filename, size, progress_cb)
+                    await put(temp_path, key, filename, size, progress_cb,
+                              follow=follow)
                 except _S3RetryableError as e:
                     last_error = str(e)
                     log.warning(
@@ -1599,7 +1798,7 @@ def _todus_file_type(filename):
 
 
 async def _put_presigned(temp_path, url, size, progress_cb=None,
-                         content_disposition=None):
+                         content_disposition=None, follow=None):
     """PUT en streaming a la URL prefirmada que asignó el servidor.
 
     Como la app oficial: Content-Type application/octet-stream y
@@ -1612,6 +1811,7 @@ async def _put_presigned(temp_path, url, size, progress_cb=None,
     y el servidor rechazarla: por eso quien llama la intenta primero
     y reintenta sin ella ante cualquier rechazo.
     """
+    _follow_precheck(follow)
     headers = {
         "Content-Type": "application/octet-stream",
         "Content-Length": str(size),
@@ -1621,11 +1821,21 @@ async def _put_presigned(temp_path, url, size, progress_cb=None,
     timeout = aiohttp.ClientTimeout(
         total=None, connect=30, sock_connect=30, sock_read=600
     )
-    f = open(temp_path, "rb")
-    poll = _start_put_progress(f, size, progress_cb)
+    f = None
+    cell = [0]
+    if follow is not None:
+        # Solape: el cuerpo sigue al temporal en crecimiento. El
+        # Content-Length explícito hace el formato de red idéntico al
+        # del file object (sin chunked): la firma no se entera.
+        data = _follow_body(follow, size, cell)
+        poll = _start_put_progress(lambda: cell[0], size, progress_cb)
+    else:
+        f = open(temp_path, "rb")
+        data = f
+        poll = _start_put_progress(f.tell, size, progress_cb)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.put(url, data=f, headers=headers) as resp:
+            async with session.put(url, data=data, headers=headers) as resp:
                 if resp.status in (200, 201, 204):
                     body = await resp.text()
                     if "<Error>" in body:
@@ -1633,6 +1843,10 @@ async def _put_presigned(temp_path, url, size, progress_cb=None,
                             f"el PUT oficial devolvió un error con HTTP "
                             f"{resp.status}: {body[:200].strip()}"
                         )
+                    if follow is not None and cell[0] != size:
+                        raise _S3RetryableError(
+                            "la subida solapada no envió el cuerpo "
+                            f"completo ({cell[0]}/{size} bytes)")
                     return
                 detail = (await resp.text())[:200].strip()
                 if resp.status >= 500:
@@ -1645,10 +1859,11 @@ async def _put_presigned(temp_path, url, size, progress_cb=None,
     finally:
         if poll is not None:
             poll.cancel()
-        try:
-            f.close()
-        except Exception:
-            pass
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 async def _verify_official_url(url, size):
@@ -1730,7 +1945,7 @@ async def _todus_reserve(phone, token, size, ftype, filename):
 
 
 async def _upload_official(temp_path, filename, size, status_cb=None,
-                           progress_cb=None):
+                           progress_cb=None, follow=None):
     """Sube por el flujo oficial y devuelve la URL de descarga.
 
     Lanza excepción ante cualquier fallo: subir_a_s3 decide entonces
@@ -1770,9 +1985,12 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
                 try:
                     await _put_presigned(
                         temp_path, put_url, size, progress_cb,
-                        content_disposition=disp if use_disp else None)
+                        content_disposition=disp if use_disp else None,
+                        follow=follow)
                     last_err = None
                     break
+                except _ProducerFailedError:
+                    raise  # descarga muerta: re-reservar no arregla nada
                 except _S3RetryableError as e:
                     last_err = e
                     if use_disp:
@@ -1877,7 +2095,7 @@ async def _settle_guardian(collected, size, settle, repair_cb):
 
 
 async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
-                     progress_cb=None, repair_cb=None):
+                     progress_cb=None, repair_cb=None, follow=None):
     """Sube el archivo a S3.
 
     Devuelve (url_principal, [urls_espejo], verificacion_pendiente):
@@ -1914,13 +2132,23 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
     oficial (_upload_official: reserva todus:purl + PUT a la URL que
     asigna el servidor, objeto registrado fuera del barrido). Todo lo
     anterior queda entonces como respaldo automático.
+
+    `follow` (_FollowSource, solape STREAM_OVERLAP): si viene, el
+    archivo aún se está descargando y los PUT lo leen a medida que
+    crece, con `size` = tamaño anunciado. Todo lo demás (vías,
+    reintentos, espejos, verificación, guardián) es idéntico.
     """
-    actual_size = os.path.getsize(temp_path)
-    if size and size != actual_size:
-        log.warning(
-            f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
-        )
-    size = actual_size
+    if follow is None:
+        actual_size = os.path.getsize(temp_path)
+        if size and size != actual_size:
+            log.warning(
+                f"S3: tamaño declarado {size} != real {actual_size}; uso el real"
+            )
+        size = actual_size
+    # Con follow el archivo aún está creciendo: manda el tamaño
+    # anunciado. Si el real acaba difiriendo, el cuerpo de los PUT
+    # explota (_ProducerFailedError) y _download_then_upload cae a la
+    # subida clásica con el tamaño verdadero.
 
     # --- Vía oficial de toDus (ToDus-SDK) si hay cuenta ---
     # Cualquier fallo cae a la vía anónima adaptativa de abajo: la
@@ -1928,7 +2156,8 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
     if _todus_official_enabled():
         try:
             url = await _upload_official(
-                temp_path, filename, size, status_cb, progress_cb)
+                temp_path, filename, size, status_cb, progress_cb,
+                follow=follow)
             mirrors = []
             if TODUS_ANON_MIRROR and S3_UNSIGNED:
                 try:
@@ -1937,7 +2166,7 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
                     murl = s3_public_url(mkey)
                     await _upload_and_verify(
                         temp_path, mkey, murl, filename, size,
-                        progress_cb=progress_cb)
+                        progress_cb=progress_cb, follow=follow)
                     mirrors = [murl]
                 except Exception as e:
                     log.warning(
@@ -1997,7 +2226,8 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
             try:
                 await _upload_and_verify(
                     temp_path, key, url, filename, size,
-                    progress_cb=_p if progress_cb else None)
+                    progress_cb=_p if progress_cb else None,
+                    follow=follow)
             except _S3UploadExhausted as e:
                 errors.append(f"{prefix or 'raíz'}: {e}")
                 log.warning(f"S3: namespace '{prefix}' agotado: {e}")
@@ -2274,6 +2504,99 @@ async def _send_links_txt(chat_id, results):
         f"Lote: {payload.name} enviado a {chat_id} ({len(results)} URLs)")
 
 
+# ============== SOLAPE DESCARGA→SUBIDA ==============
+async def _download_then_upload(produce, temp_path, filename, size_hint, *,
+                                allow_overlap, user_id=None, status_cb=None,
+                                progress_cb=None, repair_cb=None,
+                                size_cb=None):
+    """Descarga un archivo (produce) y lo sube, solapando si se puede.
+
+    `produce` es una corrutina sin argumentos que baja el archivo a
+    temp_path (puede devolver datos extra, que se propagan tal cual).
+    Devuelve (resultado_de_subir_a_s3, resultado_de_produce, solapado).
+
+    Sin solape es el camino de siempre: bajar entero → subir. Con
+    solape, la descarga corre como tarea y subir_a_s3 lee el temporal
+    mientras crece (_FollowSource) con `size_hint` como tamaño
+    anunciado. Invariantes del solape:
+
+    - Una subida solapada solo puede tener éxito si la descarga
+      escribió EXACTAMENTE el tamaño anunciado (_follow_body aborta
+      cualquier otra cosa: un archivo incompleto jamás se entrega).
+    - Si la descarga falla, manda su excepción (como en el camino
+      clásico) y el resultado de la subida se descarta.
+    - Si la subida solapada falla pero la descarga acabó bien, se
+      reintenta con la subida clásica desde el archivo completo: el
+      peor caso del solape es el tiempo de siempre más un intento.
+
+    `size_cb(n)` (sync, opcional) se avisa al conocer el tamaño real,
+    para que quien llama pinte progresos/tarjetas con el dato bueno.
+    """
+    def _note(n):
+        if size_cb is not None:
+            try:
+                size_cb(n)
+            except Exception:
+                pass
+
+    overlap = bool(STREAM_OVERLAP and allow_overlap and size_hint
+                   and size_hint >= STREAM_OVERLAP_MIN_SIZE)
+    t0 = time.monotonic()
+    if not overlap:
+        pres = await produce()
+        size = os.path.getsize(temp_path)
+        _note(size)
+        up = await subir_a_s3(
+            temp_path, filename, size, user_id=user_id,
+            status_cb=status_cb, progress_cb=progress_cb,
+            repair_cb=repair_cb)
+        return up, pres, False
+
+    follow = _FollowSource(temp_path, size_hint)
+
+    async def _run_producer():
+        try:
+            res = await produce()
+        except BaseException as e:
+            follow.finish(error=e)
+            raise
+        follow.finish()
+        return res
+
+    prod = asyncio.create_task(_run_producer())
+    upload_res, upload_err = None, None
+    try:
+        try:
+            upload_res = await subir_a_s3(
+                temp_path, filename, size_hint, user_id=user_id,
+                status_cb=status_cb, progress_cb=progress_cb,
+                repair_cb=repair_cb, follow=follow)
+        except Exception as e:
+            upload_err = e
+        pres = await prod
+    finally:
+        if not prod.done():
+            prod.cancel()
+            try:
+                await prod
+            except BaseException:
+                pass
+    size = os.path.getsize(temp_path)
+    _note(size)
+    if upload_res is not None:
+        log.info(
+            f"Solape OK: descarga+subida de {format_size(size_hint)} "
+            f"en {time.monotonic() - t0:.0f}s: {filename}")
+        return upload_res, pres, True
+    log.warning(
+        f"Solape: la subida en paralelo falló ({upload_err}); se sube "
+        f"por el camino clásico desde el archivo completo: {filename}")
+    up = await subir_a_s3(
+        temp_path, filename, size, user_id=user_id,
+        status_cb=status_cb, progress_cb=progress_cb, repair_cb=repair_cb)
+    return up, pres, False
+
+
 # ============== MAIN PROCESSOR ==============
 async def process_job(job):
     if job.kind == "tg_media":
@@ -2352,57 +2675,84 @@ async def _process_tg_media(job):
         job.temp_paths.append(temp_path)
 
         check_disk_space()
+        filename = safe_name
+        size = size_hint  # se sustituye por el real vía _note_size
+        # Solape (subir mientras se recibe de Telegram): solo con
+        # tamaño conocido y que merezca la pena; las fotos no traen
+        # doc.size (hint=0) y van por el camino clásico.
+        overlap = bool(
+            STREAM_OVERLAP and size_hint
+            and size_hint >= STREAM_OVERLAP_MIN_SIZE)
+        prog = {"down": None, "up": None}
+
+        def _note_size(real):
+            nonlocal size
+            size = real
+
         # Un solo mensaje para todo el trabajo: se va editando
-        # (Recibiendo % → Subiendo % → tarjeta final con el enlace).
+        # (Recibiendo % → Subiendo % → tarjeta final con el enlace;
+        # con solape muestra ambos % a la vez: Recibiendo X% ·
+        # Subiendo Y%).
         status_msg = await tg_edit_status(
             chat_id, status_msg,
+            _render_overlap_progress(
+                "receiving", safe_name, size_hint, 0, None)
+            if overlap else
             _render_status_progress("receiving", safe_name, size_hint)
         )
 
         async def _emit_recv(pct):
-            await tg_edit_quiet(
-                chat_id, status_msg,
-                _render_status_progress(
-                    "receiving", safe_name, size_hint, pct))
+            if overlap:
+                prog["down"] = pct
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_overlap_progress(
+                        "receiving", safe_name, size_hint,
+                        prog["down"], prog["up"]))
+            else:
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_status_progress(
+                        "receiving", safe_name, size_hint, pct))
 
         recv_progress = _ThrottledProgress(_emit_recv)
 
-        # Descargar con Telethon (con % en vivo)
-        try:
-            async with asyncio.timeout(1800):
-                await _tg_client.download_media(
-                    message=message,
-                    file=temp_path,
-                    progress_callback=recv_progress.report,
-                )
-        except asyncio.TimeoutError:
-            raise RuntimeError("Tiempo agotado descargando desde Telegram")
-        except Exception as e:
-            raise RuntimeError(f"Error descargando desde Telegram: {e}")
-
-        if not os.path.exists(temp_path):
-            raise RuntimeError("La descarga no produjo ningún archivo")
-
-        size = os.path.getsize(temp_path)
-        if size > MAX_FILE_SIZE:
-            raise RuntimeError(f"Archivo descargado ({format_size(size)}) supera el límite")
-
-        filename = safe_name
-
-        # Mensaje de progreso: subiendo
-        status_msg = await tg_edit_status(
-            chat_id, status_msg,
-            _render_status_progress("uploading", filename, size)
-        )
+        async def _produce():
+            # Descargar con Telethon (con % en vivo)
+            try:
+                async with asyncio.timeout(1800):
+                    await _tg_client.download_media(
+                        message=message,
+                        file=temp_path,
+                        progress_callback=recv_progress.report,
+                    )
+            except asyncio.TimeoutError:
+                raise RuntimeError("Tiempo agotado descargando desde Telegram")
+            except Exception as e:
+                raise RuntimeError(f"Error descargando desde Telegram: {e}")
+            if not os.path.exists(temp_path):
+                raise RuntimeError("La descarga no produjo ningún archivo")
+            real = os.path.getsize(temp_path)
+            if real > MAX_FILE_SIZE:
+                raise RuntimeError(
+                    f"Archivo descargado ({format_size(real)}) supera el límite")
 
         async def _s3_status(text):
             nonlocal status_msg
             status_msg = await tg_edit_status(chat_id, status_msg, text)
 
         async def _emit_up(pct):
-            await tg_edit_quiet(
-                chat_id, status_msg,
-                _render_status_progress("uploading", filename, size, pct))
+            if overlap:
+                prog["up"] = pct
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_overlap_progress(
+                        "receiving", safe_name, size_hint,
+                        prog["down"], prog["up"]))
+            else:
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_status_progress("uploading", filename, size, pct))
 
         up_progress = _ThrottledProgress(_emit_up)
 
@@ -2436,11 +2786,13 @@ async def _process_tg_media(job):
                     mirror_url=alive_urls[1] if len(alive_urls) > 1 else None,
                     source=source_label, note=note_rep))
 
-        url_final, _url_espejos, _pending = await subir_a_s3(
-            temp_path, filename, size, user_id=job.user_id,
-            status_cb=_s3_status, progress_cb=up_progress.report,
-            repair_cb=_repair,
-        )
+        (url_final, _url_espejos, _pending), _pres, _ov = (
+            await _download_then_upload(
+                _produce, temp_path, filename, size_hint,
+                allow_overlap=overlap, user_id=job.user_id,
+                status_cb=_s3_status, progress_cb=up_progress.report,
+                repair_cb=_repair, size_cb=_note_size))
+        size = os.path.getsize(temp_path)
         url_espejo = _url_espejos[0] if _url_espejos else None
         _note = ("⏳ comprobando que el enlace sobrevive…"
                  if _pending else None)
@@ -2547,92 +2899,50 @@ async def _process_url(job):
             _render_status_progress("downloading", filename)
         )
 
+        prog = {"down": None, "up": None}
+        overlap = False  # se decide tras el HEAD (hace falta el tamaño)
+        total = 0
+
         async def _emit_dl(pct):
-            await tg_edit_quiet(
-                chat_id, status_msg,
-                _render_status_progress("downloading", filename, None, pct))
+            if overlap:
+                prog["down"] = pct
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_overlap_progress(
+                        "downloading", filename, total,
+                        prog["down"], prog["up"]))
+            else:
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_status_progress("downloading", filename, None, pct))
 
         dl_progress = _ThrottledProgress(_emit_dl)
 
-        async with aiohttp.ClientSession() as session:
-            async with asyncio.timeout(1200):
-                total = 0
-                accepts_ranges = False
-                try:
-                    async with session.head(url, headers=BROWSER_HEADERS) as h:
-                        if h.status < 400:
-                            total = int(h.headers.get("Content-Length", 0))
-                            accepts_ranges = (
-                                h.headers.get("Accept-Ranges", "").lower() == "bytes"
-                            )
-                except Exception:
-                    pass
+        # Callbacks de la subida, definidos ANTES de descargar: con
+        # solape, la subida arranca durante la descarga y los
+        # necesita desde el primer byte.
+        size = 0  # se fija con el tamaño real vía _note_size
 
-                if total and total > MAX_FILE_SIZE:
-                    raise RuntimeError(
-                        f"Archivo de {format_size(total)} — supera el límite"
-                    )
-
-                size_downloaded = 0
-                content_type = None
-
-                if (
-                    PARALLEL_URL_DOWNLOAD
-                    and accepts_ranges
-                    and total >= PARALLEL_URL_MIN_SIZE
-                ):
-                    try:
-                        size_downloaded, content_type = await _download_parallel(
-                            session, url, temp_path, total, job,
-                            dl_progress.report
-                        )
-                    except RuntimeError as e:
-                        if "no soporta Range" in str(e):
-                            log.info("Cayendo a descarga secuencial")
-                            size_downloaded, content_type = await _download_sequential(
-                                session, url, temp_path, total, job,
-                                dl_progress.report
-                            )
-                        else:
-                            raise
-                else:
-                    size_downloaded, content_type = await _download_sequential(
-                        session, url, temp_path, total, job,
-                        dl_progress.report
-                    )
-
-        # Si la URL no tenía extensión clara, usar Content-Type
-        if (not raw_name or "." not in raw_name) and content_type:
-            inferred_ext = ext_from_content_type(content_type)
-            if inferred_ext:
-                filename = filename.rsplit(".", 1)[0] + inferred_ext
-                new_temp = temp_path.rsplit(".", 1)[0] + inferred_ext
-                try:
-                    os.rename(temp_path, new_temp)
-                    if temp_path in job.temp_paths:
-                        job.temp_paths.remove(temp_path)
-                    job.temp_paths.append(new_temp)
-                    temp_path = new_temp
-                    ext = inferred_ext
-                except Exception:
-                    pass
-
-        size = os.path.getsize(temp_path)
-
-        # Estado: subiendo
-        status_msg = await tg_edit_status(
-            chat_id, status_msg,
-            _render_status_progress("uploading", filename, size)
-        )
+        def _note_size(real):
+            nonlocal size
+            size = real
 
         async def _s3_status(text):
             nonlocal status_msg
             status_msg = await tg_edit_status(chat_id, status_msg, text)
 
         async def _emit_up(pct):
-            await tg_edit_quiet(
-                chat_id, status_msg,
-                _render_status_progress("uploading", filename, size, pct))
+            if overlap:
+                prog["up"] = pct
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_overlap_progress(
+                        "downloading", filename, total,
+                        prog["down"], prog["up"]))
+            else:
+                await tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_status_progress("uploading", filename, size, pct))
 
         up_progress = _ThrottledProgress(_emit_up)
 
@@ -2666,11 +2976,133 @@ async def _process_url(job):
                     mirror_url=alive_urls[1] if len(alive_urls) > 1 else None,
                     source="web", note=note_rep))
 
-        url_final, _url_espejos, _pending = await subir_a_s3(
-            temp_path, filename, size, user_id=job.user_id,
-            status_cb=_s3_status, progress_cb=up_progress.report,
-            repair_cb=_repair,
-        )
+        # HEAD para conocer tamaño y rangos ANTES de bajar nada:
+        # decide el modo (paralelo clásico / secuencial clásico /
+        # solape). El camino clásico de abajo lo repite dentro de su
+        # sesión, como siempre; aquí solo se usa para decidir.
+        accepts_ranges = False
+        try:
+            async with aiohttp.ClientSession() as _hs:
+                async with asyncio.timeout(120):
+                    async with _hs.head(url, headers=BROWSER_HEADERS) as h:
+                        if h.status < 400:
+                            total = int(h.headers.get("Content-Length", 0))
+                            accepts_ranges = (
+                                h.headers.get("Accept-Ranges", "").lower() == "bytes"
+                            )
+        except Exception:
+            pass
+
+        if total and total > MAX_FILE_SIZE:
+            raise RuntimeError(
+                f"Archivo de {format_size(total)} — supera el límite"
+            )
+
+        # Solape solo si: tamaño conocido y que merezca la pena,
+        # nombre ya con extensión (si hubiera que inferirla por
+        # Content-Type, el nombre de la subida cambiaría a mitad) y
+        # sin descarga paralela (escribe partes sueltas en ficheros
+        # aparte: no hay una cola de archivo que la subida siga).
+        overlap = bool(
+            STREAM_OVERLAP and total
+            and total >= STREAM_OVERLAP_MIN_SIZE
+            and raw_name and "." in raw_name
+            and not (PARALLEL_URL_DOWNLOAD and accepts_ranges
+                     and total >= PARALLEL_URL_MIN_SIZE))
+
+        if overlap:
+            async def _produce():
+                async with aiohttp.ClientSession() as session:
+                    async with asyncio.timeout(1200):
+                        return await _download_sequential(
+                            session, url, temp_path, total, job,
+                            dl_progress.report)
+
+            (url_final, _url_espejos, _pending), _dlres, _ov = (
+                await _download_then_upload(
+                    _produce, temp_path, filename, total,
+                    allow_overlap=True, user_id=job.user_id,
+                    status_cb=_s3_status, progress_cb=up_progress.report,
+                    repair_cb=_repair, size_cb=_note_size))
+            size_downloaded, content_type = _dlres
+            size = os.path.getsize(temp_path)
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with asyncio.timeout(1200):
+                    total = 0
+                    accepts_ranges = False
+                    try:
+                        async with session.head(url, headers=BROWSER_HEADERS) as h:
+                            if h.status < 400:
+                                total = int(h.headers.get("Content-Length", 0))
+                                accepts_ranges = (
+                                    h.headers.get("Accept-Ranges", "").lower() == "bytes"
+                                )
+                    except Exception:
+                        pass
+
+                    if total and total > MAX_FILE_SIZE:
+                        raise RuntimeError(
+                            f"Archivo de {format_size(total)} — supera el límite"
+                        )
+
+                    size_downloaded = 0
+                    content_type = None
+
+                    if (
+                        PARALLEL_URL_DOWNLOAD
+                        and accepts_ranges
+                        and total >= PARALLEL_URL_MIN_SIZE
+                    ):
+                        try:
+                            size_downloaded, content_type = await _download_parallel(
+                                session, url, temp_path, total, job,
+                                dl_progress.report
+                            )
+                        except RuntimeError as e:
+                            if "no soporta Range" in str(e):
+                                log.info("Cayendo a descarga secuencial")
+                                size_downloaded, content_type = await _download_sequential(
+                                    session, url, temp_path, total, job,
+                                    dl_progress.report
+                                )
+                            else:
+                                raise
+                    else:
+                        size_downloaded, content_type = await _download_sequential(
+                            session, url, temp_path, total, job,
+                            dl_progress.report
+                        )
+
+            # Si la URL no tenía extensión clara, usar Content-Type
+            if (not raw_name or "." not in raw_name) and content_type:
+                inferred_ext = ext_from_content_type(content_type)
+                if inferred_ext:
+                    filename = filename.rsplit(".", 1)[0] + inferred_ext
+                    new_temp = temp_path.rsplit(".", 1)[0] + inferred_ext
+                    try:
+                        os.rename(temp_path, new_temp)
+                        if temp_path in job.temp_paths:
+                            job.temp_paths.remove(temp_path)
+                        job.temp_paths.append(new_temp)
+                        temp_path = new_temp
+                        ext = inferred_ext
+                    except Exception:
+                        pass
+
+            size = os.path.getsize(temp_path)
+
+            # Estado: subiendo
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_status_progress("uploading", filename, size)
+            )
+
+            url_final, _url_espejos, _pending = await subir_a_s3(
+                temp_path, filename, size, user_id=job.user_id,
+                status_cb=_s3_status, progress_cb=up_progress.report,
+                repair_cb=_repair,
+            )
         url_espejo = _url_espejos[0] if _url_espejos else None
         _note = ("⏳ comprobando que el enlace sobrevive…"
                  if _pending else None)

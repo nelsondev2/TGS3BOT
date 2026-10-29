@@ -64,6 +64,12 @@ services:
         # mensaje si el barrido borra alguna copia. "0" = esperar todo
         # el settle antes de entregar nada (clásico, más lento).
         value: "1"
+      - key: STREAM_OVERLAP
+        # "1" = solapar descarga y subida: se empieza a subir a toDus
+        # mientras el archivo aún llega al servidor (el total pasa de
+        # bajar+subir a ~la fase más lenta). Si el solape falla, se
+        # reintenta con la subida clásica desde el disco. "0" = clásico.
+        value: "1"
       # NOTA: ya no se usa S3_KEY_PREFIX (singular). Si tu servicio lo
       # tenía en "users" o "users/df", el código lo interpreta como
       # "lista por defecto" por compatibilidad; puedes borrar la var.
