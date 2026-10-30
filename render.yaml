@@ -116,6 +116,12 @@ services:
       - key: TODUS_PERSISTENT
         # "1" = pedir la reserva como persistente (cae solo a false si el server la rechaza)
         value: "1"
+      - key: TODUS_UPLOAD_AS_FILE
+        # "1" = reservar TODO como archivo (tipo FILE) en la vía oficial:
+        # los enlaces de tipo video quedan en todus/video/... y el
+        # servidor los deniega en anónimo (AccessDenied). No tocar salvo
+        # que quieras el tipo por extensión de antes ("0").
+        value: "1"
       - key: ADMIN_TG_IDS
         # CSV de IDs que pueden usar /toduslogin en MODO BOT (en userbot, solo el dueño)
         sync: false
