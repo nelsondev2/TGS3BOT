@@ -248,6 +248,16 @@ TODUS_PERSISTENT = os.environ.get("TODUS_PERSISTENT", "1") == "1"
 # Tras una subida oficial OK, subir además una copia anónima como
 # espejo (doble subida; por defecto no).
 TODUS_ANON_MIRROR = os.environ.get("TODUS_ANON_MIRROR", "0") == "1"
+# Reservar TODO como tipo FILE (0) en vez del tipo por extensión
+# (VIDEO/AUDIO/PICTURE). Medido en producción (2026-10-29): el get=
+# de un video queda bajo todus/video/... y el bucket responde
+# AccessDenied a la lectura anónima — son objetos para la app, que
+# descarga con Authorization: Bearer (ver _needs_auth del SDK);
+# el de tipo file (todus/file/...) sí se descarga sin credenciales.
+# Este bot entrega enlaces para bajar FUERA de toDus (IDM/navegador),
+# así que el tipo útil para todo es FILE. "0" = tipo por extensión
+# (comportamiento anterior: enlaces de video inservibles).
+TODUS_UPLOAD_AS_FILE = os.environ.get("TODUS_UPLOAD_AS_FILE", "1") == "1"
 # Quién puede gestionar la cuenta de toDus desde Telegram
 # (/toduslogin, /toduslogout...). En modo userbot el dueño siempre
 # puede; en modo bot hacen falta IDs aquí (CSV). Sin esto, el login
@@ -1870,10 +1880,12 @@ async def _verify_official_url(url, size):
     """Verifica la URL de descarga oficial con GET Range bytes=0-0.
 
     Nunca HEAD: una URL prefirmada para GET puede rechazarlo por la
-    firma. Devuelve (estado, detalle) como _verify_s3_object, pero
-    aquí solo 404/410 confirmado (o tamaño distinto) cuenta como
-    muerto; cualquier otra cosa es "unverifiable" (el PUT aceptado
-    por el servidor ya es buena señal: no tumbar la entrega).
+    firma. Devuelve (estado, detalle) como _verify_s3_object. Cuenta
+    como muerto: 404/410, 401/403 (sin lectura pública el enlace no
+    sirve fuera de la app: medido con los objetos todus/video/...,
+    AccessDenied anónimo) y tamaño distinto. El resto (5xx, red) es
+    "unverifiable": el PUT aceptado ya es buena señal y no se tumba
+    la entrega por un tropiezo transitorio de la verificación.
     """
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
     headers = {
@@ -1901,6 +1913,13 @@ async def _verify_official_url(url, size):
                                 "Content-Disposition="
                                 f"{resp.headers.get('Content-Disposition')!r}")
                             return "ok", f"HTTP {resp.status}"
+                        if resp.status in (401, 403):
+                            # Sin acceso público es un enlace muerto
+                            # a efectos de entregarlo, y no se cura
+                            # reintentando: fuera a la primera.
+                            return "dead", (
+                                f"HTTP {resp.status} "
+                                "(sin lectura pública)")
                         if resp.status in (404, 410):
                             saw_404 = True
                             last = f"HTTP {resp.status}"
@@ -1957,7 +1976,8 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
             "cuenta de toDus no configurada (usa /toduslogin o "
             "TODUS_PHONE/TODUS_PASSWORD)")
     phone = _todus_creds_load().get("phone") or ""
-    ftype = _todus_file_type(filename)
+    # FILE (0) siempre salvo opt-out: ver TODUS_UPLOAD_AS_FILE.
+    ftype = 0 if TODUS_UPLOAD_AS_FILE else _todus_file_type(filename)
 
     async def _notify(step):
         if status_cb:
@@ -1969,7 +1989,8 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
     await _notify("uploading")
     put_url, get_url, token = await _todus_reserve(
         phone, token, size, ftype, filename)
-    log.info(f"ToDus: put={put_url[:90]} get={get_url[:90]}")
+    log.info(
+        f"ToDus: tipo={ftype} put={put_url[:90]} get={get_url[:90]}")
 
     # PUT a la URL asignada. Los 5xx/red reintentan con la misma URL;
     # un 4xx suele ser firma caducada/rechazada: se vuelve a reservar.
@@ -2024,31 +2045,48 @@ async def _upload_official(temp_path, filename, size, status_cb=None,
         f"({'Content-Disposition enviada' if use_disp else 'sin Content-Disposition'})")
 
     # URL de descarga: si es la corta (todus.cu/...), se resuelve a la
-    # real vía todus:gurl; si ya es una URL de objeto, va tal cual.
+    # real vía todus:gurl; si ya es una URL de objeto, va tal cual. Y
+    # si la de objeto resulta NO descargable anónimamente (p. ej.
+    # AccessDenied en un prefijo no público), se pide igualmente la
+    # real vía gurl — es lo que la app y el SDK hacen siempre antes
+    # de descargar — y se verifica también esa antes de rendirse.
     deliver = get_url
-    if (urlparse(get_url).hostname or "").lower() == "todus.cu":
+    resolved_tried = False
+
+    async def _resolve(url_in):
+        nonlocal token
         for _try in range(2):
             try:
-                resolved = await asyncio.to_thread(
-                    _todus_resolve_sync, phone, token, get_url)
-                if resolved:
-                    deliver = resolved
-                break
+                out = await asyncio.to_thread(
+                    _todus_resolve_sync, phone, token, url_in)
+                return out or None
             except _TodusTokenExpired:
                 token = await _todus_ensure_token(force=True)
                 if not token:
-                    break
+                    return None
             except Exception as e:
-                log.warning(
-                    f"ToDus: no se pudo resolver la URL corta ({e}); "
-                    "se entrega tal cual")
-                break
+                log.warning(f"ToDus: no se pudo resolver la URL ({e})")
+                return None
+        return None
+
+    if (urlparse(get_url).hostname or "").lower() == "todus.cu":
+        resolved_tried = True
+        resolved = await _resolve(get_url)
+        if resolved:
+            deliver = resolved
 
     await _notify("verifying")
     state, detail = await _verify_official_url(deliver, size)
+    if state == "dead" and not resolved_tried:
+        resolved = await _resolve(get_url)
+        if resolved and resolved != deliver:
+            log.info(f"ToDus: URL real vía gurl: {resolved[:120]}")
+            state2, detail2 = await _verify_official_url(resolved, size)
+            if state2 != "dead":
+                deliver, state, detail = resolved, state2, detail2
     if state == "dead":
         raise RuntimeError(
-            f"la URL oficial no responde ({detail}): {deliver[:90]}")
+            f"la URL oficial no es descargable ({detail}): {deliver[:90]}")
     if state == "unverifiable":
         log.warning(
             f"ToDus: URL oficial no verificable ({detail}); se entrega "
