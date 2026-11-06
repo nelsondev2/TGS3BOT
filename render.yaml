@@ -83,6 +83,11 @@ services:
         value: "2000"
       - key: PARALLEL_URL_DOWNLOAD
         value: "1"
+      - key: URL_DOWNLOAD_RETRIES
+        # Reintentos por URL ante cortes de red / 5xx / 429 del
+        # origen, con reanudación por Range. Los 4xx definitivos
+        # (403/404) fallan sin reintentar.
+        value: "4"
       - key: WATCHDOG_ENABLED
         value: "1"
       - key: WATCHDOG_LIFETIME

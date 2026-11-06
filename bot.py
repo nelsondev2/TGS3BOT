@@ -203,6 +203,19 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_MB", "2000")) * 1024 * 1024
 # Telegram tiene límite de 2GB para bots y 4GB para premium
 TG_UPLOAD_LIMIT = int(os.environ.get("TG_UPLOAD_LIMIT_MB", "2000")) * 1024 * 1024
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE_MB", "16")) * 1024 * 1024
+# Reintentos de descarga por URL ante tropiezos transitorios (corte de
+# red, 5xx/429 del origen). La reanudación por Range evita empezar de
+# cero si ya hay bytes buenos en disco.
+URL_DOWNLOAD_RETRIES = max(1, int(os.environ.get("URL_DOWNLOAD_RETRIES", "4") or "4"))
+# Timeout del TRANSPORTE de cada intento de descarga. CRÍTICO: sin
+# esto aiohttp usa su default total=300s, que cubre TAMBIÉN la lectura
+# del cuerpo — cualquier archivo que tardara >5 min en bajar (enlaces
+# lentos) moría a mitad con TimeoutError. total=None: la duración la
+# gobierna el asyncio.timeout(1200) exterior; aquí solo se acotan la
+# conexión y el silencio entre lecturas.
+_DL_TIMEOUT = aiohttp.ClientTimeout(
+    total=None, connect=30, sock_connect=30, sock_read=300
+)
 
 # --- Watchdog ---
 WATCHDOG_LIFETIME = int(os.environ.get("WATCHDOG_LIFETIME", "14100"))
@@ -269,6 +282,12 @@ ADMIN_TG_IDS = (
 )
 
 # --- HTTP Headers ---
+# OJO con Accept-Encoding: aiohttp solo decodifica gzip/deflate por
+# sí mismo; 'br' (Brotli) requiere el paquete brotli, que NO está en
+# requirements.txt. Si el origen elegía br, el archivo se guardaba
+# comprimido (basura) y el recuento de bytes no cuadraba con el
+# tamaño anunciado. gzip/deflate se pueden ofrecer siempre:
+# aiohttp los descomprime de forma transparente.
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -280,7 +299,7 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -2352,25 +2371,133 @@ async def subir_a_s3(temp_path, filename, size, user_id=None, status_cb=None,
     return urls[0], urls[1:], False
 
 # ============== DOWNLOAD ==============
+class _DownloadRetry(RuntimeError):
+    """Fallo transitorio de descarga: vale la pena otro intento."""
+
+
+class _DownloadRestart(RuntimeError):
+    """Los bytes ya bajados no sirven para reanudar: empezar de cero."""
+
+
+def _dl_status_retryable(status):
+    """HTTP transitorios de descarga (no confundir con 403/404, que son
+    definitivos y deben fallar al instante, como siempre)."""
+    return status in (408, 425, 429) or 500 <= status < 600
+
+
 async def _download_sequential(session, url, temp_path, total, job,
                                progress_cb=None):
+    """Descarga secuencial con reintentos y reanudación por Range.
+
+    Antes, CUALQUIER tropiezo a mitad del archivo (corte de red,
+    lectura incompleta, 5xx/429 del origen, o el timeout total de
+    300 s que aiohttp aplica por defecto a toda la petición) le
+    llegaba al usuario como error en seco: por eso tantas URL
+    "fallaban" siendo buenas. Ahora cada intento:
+
+    - usa _DL_TIMEOUT (sin límite total: el cap lo pone el
+      asyncio.timeout exterior; solo se acotan conexión y silencios),
+    - si ya hay bytes buenos en disco pide SOLO el resto con
+      Range: bytes=<offset>- y solo lo acepta si el servidor responde
+      206 con un Content-Range que arranca exactamente en el offset;
+    - si el servidor ignora el Range (200) o lo rechaza (416), se
+      re-descarga desde cero en ese mismo intento.
+
+    Los 4xx definitivos (403, 404...) fallan al primer intento, como
+    siempre. Devuelve (bytes_descargados, content_type).
+    """
     downloaded = 0
-    final_size = None
+    final_size = total or 0
     content_type = None
-    async with aiofiles.open(temp_path, "wb") as f:
-        async with session.get(url, headers=BROWSER_HEADERS) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"HTTP {resp.status}")
-            ct = resp.headers.get("Content-Type")
-            final_size = int(resp.headers.get("Content-Length", 0)) or total
-            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                await f.write(chunk)
-                downloaded += len(chunk)
-                if downloaded > MAX_FILE_SIZE:
-                    raise RuntimeError("Archivo supera el límite")
-                if progress_cb is not None:
-                    await progress_cb(downloaded, final_size or total)
-    return downloaded, ct
+    last_err = "error desconocido"
+
+    for attempt in range(1, URL_DOWNLOAD_RETRIES + 1):
+        headers = dict(BROWSER_HEADERS)
+        if downloaded:
+            headers["Range"] = f"bytes={downloaded}-"
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=_DL_TIMEOUT) as resp:
+                if resp.status >= 400:
+                    if (downloaded and resp.status == 416):
+                        # El rango pedido ya no cabe (el contenido
+                        # cambió): olvidar lo bajado y empezar limpio.
+                        downloaded = 0
+                        raise _DownloadRestart("HTTP 416 al reanudar")
+                    if (_dl_status_retryable(resp.status)
+                            and attempt < URL_DOWNLOAD_RETRIES):
+                        raise _DownloadRetry(f"HTTP {resp.status}")
+                    raise RuntimeError(f"HTTP {resp.status}")
+
+                resuming = False
+                if downloaded:
+                    if resp.status == 206:
+                        m = re.match(
+                            r"bytes\s+(\d+)-",
+                            resp.headers.get("Content-Range", ""))
+                        if m and int(m.group(1)) == downloaded:
+                            resuming = True
+                        else:
+                            # 206 sin Content-Range válido: un 206 con
+                            # origen distinto o sin cabecera NO se puede
+                            # ni reanudar ni aceptar como archivo
+                            # completo (su cuerpo es parcial): intento
+                            # nuevo, desde cero.
+                            downloaded = 0
+                            raise _DownloadRestart(
+                                "206 sin Content-Range del offset "
+                                "pedido; se re-descarga desde cero")
+                    if not resuming:
+                        # 200 (ignoró el Range): empezar de cero.
+                        downloaded = 0
+
+                ct = resp.headers.get("Content-Type")
+                if content_type is None and ct:
+                    content_type = ct
+                clen = int(resp.headers.get("Content-Length", 0) or 0)
+                if clen:
+                    # En un 206 el CL cuenta solo lo que queda.
+                    final_size = downloaded + clen if resuming else clen
+                elif not final_size:
+                    final_size = total or 0
+
+                async with aiofiles.open(
+                        temp_path, "ab" if resuming else "wb") as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded > MAX_FILE_SIZE:
+                            raise RuntimeError("Archivo supera el límite")
+                        if progress_cb is not None:
+                            await progress_cb(downloaded, final_size or total)
+            return downloaded, content_type
+        # OJO con el orden: las dos señales de control son subclases
+        # de RuntimeError; el fail-fast de RuntimeError va DESPUÉS.
+        except _DownloadRestart as e:
+            last_err = f"{e}"
+            downloaded = 0
+        except _DownloadRetry as e:
+            last_err = str(e)
+        except RuntimeError:
+            # Definitivos (HTTP 4xx, límite de tamaño): nunca se
+            # reintentan. La cancelación del timeout exterior llega
+            # como CancelledError (BaseException) y tampoco cae aquí.
+            raise
+        except (aiohttp.ClientError, ConnectionError, OSError,
+                asyncio.TimeoutError) as e:
+            # Los timeouts del asyncio.timeout exterior NO caen aquí:
+            # llegan como CancelledError (BaseException). Solo se
+            # atrapan los propios del transporte (sock_read, etc.).
+            last_err = f"error de red: {str(e)[:160]}"
+        if attempt < URL_DOWNLOAD_RETRIES:
+            delay = min(2 ** attempt, 15)
+            log.info(
+                f"Descarga: intento {attempt}/{URL_DOWNLOAD_RETRIES} "
+                f"falló ({last_err}); reintento en {delay}s: {url[:90]}")
+            await asyncio.sleep(delay)
+    raise RuntimeError(
+        f"la descarga falló tras {URL_DOWNLOAD_RETRIES} intentos "
+        f"({last_err})")
 
 
 async def _download_parallel(session, url, temp_path, total, job,
@@ -2396,7 +2523,8 @@ async def _download_parallel(session, url, temp_path, total, job,
         job.temp_paths.append(path)
         headers = dict(BROWSER_HEADERS)
         headers["Range"] = f"bytes={start}-{end}"
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url, headers=headers,
+                               timeout=_DL_TIMEOUT) as resp:
             if resp.status != 206:
                 raise RuntimeError(
                     f"Servidor no soporta Range (HTTP {resp.status} en parte {idx}). "
@@ -3022,7 +3150,8 @@ async def _process_url(job):
         try:
             async with aiohttp.ClientSession() as _hs:
                 async with asyncio.timeout(120):
-                    async with _hs.head(url, headers=BROWSER_HEADERS) as h:
+                    async with _hs.head(url, headers=BROWSER_HEADERS,
+                                        allow_redirects=True) as h:
                         if h.status < 400:
                             total = int(h.headers.get("Content-Length", 0))
                             accepts_ranges = (
@@ -3070,7 +3199,9 @@ async def _process_url(job):
                     total = 0
                     accepts_ranges = False
                     try:
-                        async with session.head(url, headers=BROWSER_HEADERS) as h:
+                        async with session.head(
+                                url, headers=BROWSER_HEADERS,
+                                allow_redirects=True) as h:
                             if h.status < 400:
                                 total = int(h.headers.get("Content-Length", 0))
                                 accepts_ranges = (
