@@ -351,7 +351,10 @@ def _probe_remote(url: str, *, free_ip: str, user_agent: str, timeout: float,
         conn.close()
         conn = None
 
-        if status in (405, 501):
+        err_snippet = ""
+        if status in (400, 403, 405, 501):
+            # Muchos proxies / S3 (p. ej. /todus/file/...) rechazan HEAD con 403 o 405
+            # aunque acepten GET con Range. Reintentamos con GET de 1 byte.
             conn, resp, final_url = _open_request(
                 url, "GET", {"Range": "bytes=0-0"},
                 free_ip=free_ip, user_agent=user_agent, timeout=timeout,
@@ -360,14 +363,22 @@ def _probe_remote(url: str, *, free_ip: str, user_agent: str, timeout: float,
             )
             status = resp.status
             headers = dict(resp.getheaders())
-            resp.read(16)
+            preview = resp.read(400)
             conn.close()
             conn = None
+            if status >= 400 and preview:
+                err_snippet = re.sub(r"\s+", " ", preview.decode("utf-8", "replace")).strip()[:160]
 
         if status in (401, 403, 404, 410):
+            detail = f" [{err_snippet}]" if err_snippet else ""
+            hint = (
+                f'\n  Prueba: python {os.path.basename(sys.argv[0])} --diagnose "{url}"'
+                if status in (401, 403) else ""
+            )
             raise DownloadError(
-                f"El servidor respondió HTTP {status} "
+                f"El servidor respondió HTTP {status}{detail} "
                 "(enlace caducado, borrado por toDus o sin acceso público)"
+                + hint
             )
 
         lower = {k.lower(): v for k, v in headers.items()}
@@ -510,8 +521,14 @@ def _download_sequential(url: str, dest_path: str, expected_total: int | None,
             status = resp.status
 
             if status in (401, 403, 404, 410):
+                preview = resp.read(400)
+                detail = ""
+                if preview:
+                    detail = " [" + re.sub(
+                        r"\s+", " ", preview.decode("utf-8", "replace")
+                    ).strip()[:160] + "]"
                 raise DownloadError(
-                    f"HTTP {status} (enlace caducado, eliminado o sin acceso)"
+                    f"HTTP {status}{detail} (enlace caducado, eliminado o sin acceso)"
                 )
 
             if status == 416:
@@ -862,6 +879,94 @@ def run_preflight_test(ips: list[str], user_agent: str, timeout: float = 5.0,
     return 0 if any_ok else 1
 
 
+def run_diagnose(raw_url: str, *, free_ip: str = DEFAULT_FREE_IP,
+                 backup_ip: str = BACKUP_FREE_IP, timeout: float = 8.0,
+                 include_direct_dns: bool = True) -> int:
+    """Diagnostica por qué una URL concreta falla (p. ej. HTTP 403) pidiendo solo 1 byte."""
+    clean_url, _ = parse_url_and_hint(raw_url)
+    sp = urlsplit(clean_url)
+    orig_host = (sp.hostname or "s3.todus.cu").lower()
+
+    probes: list[tuple[str, dict]] = [
+        (
+            f"1) UDYAT estándar ({free_ip}, sin SNI, UA {DEFAULT_UA})",
+            {"free_ip": free_ip, "user_agent": DEFAULT_UA, "force_ip": True,
+             "allow_direct": False, "sni": None},
+        ),
+        (
+            f"2) IP gratuita + UA app toDus ({free_ip}, sin SNI, UA okhttp/4.9.0)",
+            {"free_ip": free_ip, "user_agent": "okhttp/4.9.0", "force_ip": True,
+             "allow_direct": False, "sni": None},
+        ),
+        (
+            f"3) IP gratuita + SNI ({free_ip}, SNI {orig_host}, UA {DEFAULT_UA})",
+            {"free_ip": free_ip, "user_agent": DEFAULT_UA, "force_ip": True,
+             "allow_direct": False, "sni": orig_host},
+        ),
+        (
+            f"4) IP respaldo ({backup_ip}, sin SNI, UA {DEFAULT_UA})",
+            {"free_ip": backup_ip, "user_agent": DEFAULT_UA, "force_ip": True,
+             "allow_direct": False, "sni": None},
+        ),
+    ]
+    if include_direct_dns:
+        probes.append((
+            f"5) Origen DNS directo ({orig_host}, SNI {orig_host}, UA TGS3BOT/1.0)",
+            {"free_ip": orig_host, "user_agent": "TGS3BOT/1.0 (+https://s3.todus.cu)",
+             "force_ip": False, "allow_direct": True, "sni": orig_host},
+        ))
+
+    print(f"Diagnosticando (GET Range: bytes=0-0) → {clean_url}\n")
+    ok_indices: list[int] = []
+    for idx, (label, opts) in enumerate(probes, 1):
+        conn = None
+        t0 = time.monotonic()
+        try:
+            conn, resp, _ = _open_request(
+                clean_url, "GET", {"Range": "bytes=0-0"},
+                timeout=timeout, verify_tls=False, **opts,
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            st = resp.status
+            body = resp.read(300)
+            snippet = ""
+            if st >= 400 and body:
+                snippet = " · " + re.sub(
+                    r"\s+", " ", body.decode("utf-8", "replace")
+                ).strip()[:120]
+            mark = "✓" if st in (200, 206) else "✗"
+            if st in (200, 206):
+                ok_indices.append(idx)
+            print(f"  {mark} {label}\n      → HTTP {st} ({ms} ms){snippet}")
+        except Exception as e:
+            print(f"  ✗ {label}\n      → error: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    print()
+    if 1 in ok_indices:
+        print("→ La vía UDYAT estándar responde bien; puedes descargar normal.")
+    elif 2 in ok_indices:
+        print('→ Usa: --ua "okhttp/4.9.0"')
+    elif 3 in ok_indices:
+        print(f'→ Usa: --sni "{orig_host}"')
+    elif 4 in ok_indices:
+        print(f'→ Usa: --ip "{backup_ip}" (ojo: verifica saldo porque .88 puede consumir datos)')
+    elif 5 in ok_indices:
+        print(
+            f"→ El enlace sigue vivo en {orig_host}, pero {free_ip} no lo sirve "
+            "(habitual en rutas /todus/file/... frente a /stream/...). "
+            "Para tener ruta /stream/... en el bot, activa TODUS_ANON_MIRROR=1."
+        )
+    else:
+        print("→ Ninguna ruta pudo leer el objeto: el enlace caducó o requiere Bearer token.")
+    return 0 if ok_indices else 1
+
+
 def load_urls_from_file(path: str) -> list[str]:
     urls = []
     with open(path, encoding="utf-8-sig") as fh:
@@ -948,8 +1053,19 @@ def main(argv: list[str] | None = None) -> int:
         "--test", action="store_true",
         help="Probar conectividad HEAD hacia la IP gratuita y salir",
     )
+    parser.add_argument(
+        "--diagnose", metavar="URL",
+        help="Probar 1 byte contra IP gratuita, UA, SNI e IP respaldo para diagnosticar un 403",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.diagnose:
+        return run_diagnose(
+            args.diagnose,
+            free_ip=args.ip,
+            timeout=min(args.timeout, 10.0),
+        )
 
     if args.test:
         ips = [args.ip] if args.ip != DEFAULT_FREE_IP else [DEFAULT_FREE_IP, BACKUP_FREE_IP]

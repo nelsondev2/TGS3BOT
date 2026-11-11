@@ -94,7 +94,7 @@ def main() -> int:
             def do_HEAD(self):
                 path_only = self.path.split("?", 1)[0]
                 self._record(f"HEAD:{path_only}")
-                if path_only == "/forbidden":
+                if path_only in ("/forbidden", "/head403_get200", "/only_okhttp"):
                     self.send_response(403)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
@@ -142,9 +142,45 @@ def main() -> int:
                 rng = self.headers.get("Range")
 
                 if path_only == "/forbidden":
+                    err = b"<Error><Code>AccessDenied</Code></Error>"
                     self.send_response(403)
-                    self.send_header("Content-Length", "0")
+                    self.send_header("Content-Length", str(len(err)))
                     self.end_headers()
+                    self.wfile.write(err)
+                    return
+
+                if path_only == "/only_okhttp":
+                    if (self.headers.get("User-Agent") or "") != "okhttp/4.9.0":
+                        err = b"403 Blocked UA"
+                        self.send_response(403)
+                        self.send_header("Content-Length", str(len(err)))
+                        self.end_headers()
+                        self.wfile.write(err)
+                        return
+                    body = small_data[:1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes 0-0/{len(small_data)}")
+                    self.send_header("Content-Length", "1")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if path_only == "/head403_get200":
+                    m = re.match(r"bytes=(\d+)-(\d*)$", rng or "")
+                    if m:
+                        start = int(m.group(1))
+                        end = int(m.group(2)) if m.group(2) else len(small_data) - 1
+                        body = small_data[start:end + 1]
+                        self.send_response(206)
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{len(small_data)}")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(small_data)))
+                    self.end_headers()
+                    self.wfile.write(small_data)
                     return
 
                 if path_only == "/redirect_ok":
@@ -353,11 +389,19 @@ def main() -> int:
                     out_dir=out_dir, free_ip="127.0.0.1", retries=4,
                 )
                 raise AssertionError("403 debía fallar")
-            except udyat.DownloadError:
-                pass
+            except udyat.DownloadError as e:
+                assert "AccessDenied" in str(e), str(e)
             assert req_counts.get("HEAD:/forbidden") == 1, req_counts
-            assert req_counts.get("GET:/forbidden", 0) == 0, req_counts
-            print("PASS 5: 503 reintentado (3 GETs) y 403 fail-fast (1 HEAD)")
+            assert req_counts.get("GET:/forbidden", 0) == 1, req_counts
+
+            # 5b. HEAD -> 403 pero GET Range -> 206 (caso /todus/file/...)
+            p5b = udyat.download_one(
+                f"{base}/head403_get200#filename=oficial_file.bin",
+                out_dir=out_dir, free_ip="127.0.0.1", retries=2,
+            )
+            assert _sha256_file(p5b) == _sha256_bytes(small_data)
+            assert req_counts.get("HEAD:/head403_get200") == 1, req_counts
+            print("PASS 5: 503 reintentado, 403 con detalle + fallback HEAD 403->GET 206")
 
             # 6. Descarga paralela (--threads 4) > 5 MB + fallback cuando 200 en paralelo
             p6 = udyat.download_one(
@@ -422,7 +466,14 @@ def main() -> int:
                 ["127.0.0.1"], user_agent="Wget/1.21.3", timeout=3.0, port=port
             )
             assert rc_test == 0
-            print("PASS 9: Guardia anti-consumo + fallback 405 HEAD + preflight OK")
+
+            rc_diag = udyat.run_diagnose(
+                f"{base}/only_okhttp",
+                free_ip="127.0.0.1", backup_ip="127.0.0.1",
+                timeout=3.0, include_direct_dns=False,
+            )
+            assert rc_diag == 0
+            print("PASS 9: Guardia anti-consumo + fallback 405 HEAD + preflight + diagnose OK")
         finally:
             srv.shutdown()
             srv.server_close()

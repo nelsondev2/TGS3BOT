@@ -321,6 +321,9 @@ El repositorio incluye el script autónomo [`scripts/udyat_download.py`](scripts
 # 1. Probar si la IP interna responde desde tu conexión
 python scripts/udyat_download.py --test
 
+# 1b. Si un enlace concreto da HTTP 403, diagnosticar (solo pide 1 byte por vía)
+python scripts/udyat_download.py --diagnose "https://s3.todus.cu/..."
+
 # 2. Descargar un enlace suelto (anónimo u oficial firmado)
 python scripts/udyat_download.py "https://s3.todus.cu/stream/..."
 
