@@ -36,6 +36,7 @@ import http.client
 import mimetypes
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
@@ -887,38 +888,59 @@ def run_diagnose(raw_url: str, *, free_ip: str = DEFAULT_FREE_IP,
     sp = urlsplit(clean_url)
     orig_host = (sp.hostname or "s3.todus.cu").lower()
 
-    probes: list[tuple[str, dict]] = [
+    probes: list[tuple[str, dict, str]] = [
         (
             f"1) UDYAT estándar ({free_ip}, sin SNI, UA {DEFAULT_UA})",
             {"free_ip": free_ip, "user_agent": DEFAULT_UA, "force_ip": True,
              "allow_direct": False, "sni": None},
+            "",
         ),
         (
             f"2) IP gratuita + UA app toDus ({free_ip}, sin SNI, UA okhttp/4.9.0)",
             {"free_ip": free_ip, "user_agent": "okhttp/4.9.0", "force_ip": True,
              "allow_direct": False, "sni": None},
+            '--ua "okhttp/4.9.0"',
         ),
         (
             f"3) IP gratuita + SNI ({free_ip}, SNI {orig_host}, UA {DEFAULT_UA})",
             {"free_ip": free_ip, "user_agent": DEFAULT_UA, "force_ip": True,
              "allow_direct": False, "sni": orig_host},
+            f'--sni "{orig_host}"',
         ),
         (
-            f"4) IP respaldo ({backup_ip}, sin SNI, UA {DEFAULT_UA})",
+            f"4) IP gratuita + SNI + UA app ({free_ip}, SNI {orig_host}, UA okhttp/4.9.0)",
+            {"free_ip": free_ip, "user_agent": "okhttp/4.9.0", "force_ip": True,
+             "allow_direct": False, "sni": orig_host},
+            f'--sni "{orig_host}" --ua "okhttp/4.9.0"',
+        ),
+        (
+            f"5) IP gratuita + SNI + UA bot ({free_ip}, SNI {orig_host}, UA TGS3BOT/1.0)",
+            {"free_ip": free_ip, "user_agent": "TGS3BOT/1.0 (+https://s3.todus.cu)",
+             "force_ip": True, "allow_direct": False, "sni": orig_host},
+            f'--sni "{orig_host}" --ua "TGS3BOT/1.0 (+https://s3.todus.cu)"',
+        ),
+        (
+            f"6) IP respaldo ({backup_ip}, sin SNI, UA {DEFAULT_UA})",
             {"free_ip": backup_ip, "user_agent": DEFAULT_UA, "force_ip": True,
              "allow_direct": False, "sni": None},
+            f'--ip "{backup_ip}" (ojo: verifica saldo)',
         ),
     ]
     if include_direct_dns:
+        try:
+            dns_ip = socket.gethostbyname(orig_host)
+        except Exception as e:
+            dns_ip = f"error DNS: {e}"
         probes.append((
-            f"5) Origen DNS directo ({orig_host}, SNI {orig_host}, UA TGS3BOT/1.0)",
+            f"7) Origen DNS directo ({orig_host} → {dns_ip}, SNI {orig_host}, UA TGS3BOT/1.0)",
             {"free_ip": orig_host, "user_agent": "TGS3BOT/1.0 (+https://s3.todus.cu)",
              "force_ip": False, "allow_direct": True, "sni": orig_host},
+            "DIRECT_ONLY",
         ))
 
     print(f"Diagnosticando (GET Range: bytes=0-0) → {clean_url}\n")
-    ok_indices: list[int] = []
-    for idx, (label, opts) in enumerate(probes, 1):
+    ok_hits: list[tuple[int, str]] = []
+    for idx, (label, opts, tip) in enumerate(probes, 1):
         conn = None
         t0 = time.monotonic()
         try:
@@ -936,7 +958,7 @@ def run_diagnose(raw_url: str, *, free_ip: str = DEFAULT_FREE_IP,
                 ).strip()[:120]
             mark = "✓" if st in (200, 206) else "✗"
             if st in (200, 206):
-                ok_indices.append(idx)
+                ok_hits.append((idx, tip))
             print(f"  {mark} {label}\n      → HTTP {st} ({ms} ms){snippet}")
         except Exception as e:
             print(f"  ✗ {label}\n      → error: {e}")
@@ -948,23 +970,21 @@ def run_diagnose(raw_url: str, *, free_ip: str = DEFAULT_FREE_IP,
                     pass
 
     print()
-    if 1 in ok_indices:
-        print("→ La vía UDYAT estándar responde bien; puedes descargar normal.")
-    elif 2 in ok_indices:
-        print('→ Usa: --ua "okhttp/4.9.0"')
-    elif 3 in ok_indices:
-        print(f'→ Usa: --sni "{orig_host}"')
-    elif 4 in ok_indices:
-        print(f'→ Usa: --ip "{backup_ip}" (ojo: verifica saldo porque .88 puede consumir datos)')
-    elif 5 in ok_indices:
-        print(
-            f"→ El enlace sigue vivo en {orig_host}, pero {free_ip} no lo sirve "
-            "(habitual en rutas /todus/file/... frente a /stream/...). "
-            "Para tener ruta /stream/... en el bot, activa TODUS_ANON_MIRROR=1."
-        )
+    if ok_hits:
+        first_idx, first_tip = ok_hits[0]
+        if first_idx == 1:
+            print("→ La vía UDYAT estándar responde bien; puedes descargar normal.")
+        elif first_tip == "DIRECT_ONLY":
+            print(
+                f"→ El enlace sigue vivo en {orig_host}, pero {free_ip} no lo sirve "
+                "(habitual en rutas /todus/file/... frente a /stream/...). "
+                "Para tener ruta /stream/... en el bot, activa TODUS_ANON_MIRROR=1."
+            )
+        else:
+            print(f"→ Usa: {first_tip}")
     else:
         print("→ Ninguna ruta pudo leer el objeto: el enlace caducó o requiere Bearer token.")
-    return 0 if ok_indices else 1
+    return 0 if ok_hits else 1
 
 
 def load_urls_from_file(path: str) -> list[str]:
