@@ -137,6 +137,7 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `WATCHDOG_LIFETIME` | `14100` | Segundos antes de reinicio |
 | `PARALLEL_URL_DOWNLOAD` | `1` | Descarga paralela |
 | `PARALLEL_URL_PARTS` | `4` | Partes paralelas |
+| `URL_DOWNLOAD_RETRIES` | `4` | Reintentos de descarga por URL ante cortes de red / 5xx / 429, con reanudación por `Range` (no empieza de cero si ya hay bytes buenos). Los 4xx definitivos (403/404) fallan sin reintentar, como siempre |
 | `ALWAYS_SHOW_S3_URL` | `1` | Mostrar URL S3 siempre |
 | `SEND_FILE_VIA_TG` | `0` | Por defecto NO reenvía archivo (solo URL). Cambiar a `1` para reenviar archivo. Los usuarios pueden opt-in con `/sendfile` |
 | `TODUS_UPLOAD_MODE` | `auto` | `auto` = vía oficial si hay cuenta de toDus (y anónima si no la hay o si la oficial falla). `official` = como `auto` (el fallback se mantiene por resiliencia). `anonymous` = nunca usar el SDK (comportamiento anterior) |
@@ -312,6 +313,31 @@ El bot envía la **URL pública S3 como mensaje de texto**, que es ilimitado en 
 ```
 A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para desactivar, escribe `/textonly` otra vez.
 
+## 🆓 Script Python para descargar los enlaces sin gastar datos (UDYAT, Cuba)
+
+El repositorio incluye el script autónomo [`scripts/udyat_download.py`](scripts/udyat_download.py), sin dependencias externas (solo Python 3 estándar, ideal para **Termux** en Android o PC), que descarga los enlaces generados por el bot conectando por la IP interna de toDus (`152.207.206.86`) con las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`:
+
+```bash
+# 1. Probar si la IP interna responde desde tu conexión
+python scripts/udyat_download.py --test
+
+# 2. Descargar un enlace suelto (anónimo u oficial firmado)
+python scripts/udyat_download.py "https://s3.todus.cu/stream/..."
+
+# 3. Descargar todo un lote enlaces_*.txt del bot a Descargas (en Termux)
+python scripts/udyat_download.py enlaces_20261106_1200.txt -d ~/storage/downloads
+
+# 4. Acelerar archivos grandes con 4 hilos (soporta reanudación .part)
+python scripts/udyat_download.py -t 4 "https://s3.todus.cu/stream/..."
+```
+
+**Características:**
+- Respeta los nombres originales (`#filename=...` de los `enlaces_*.txt`, `Content-Disposition` o tipo MIME).
+- Reanuda descargas cortadas con `Range` (`.part`) y reintenta automáticamente ante cortes de red o `5xx`.
+- Bloquea por seguridad URLs ajenas a `s3.todus.cu` para no consumir tus datos por accidente (`--allow-direct` si quieres descargar otra URL).
+
+> ⚠️ **Nota importante:** que salga a **0 MB** depende de cómo clasifique hoy ETECSA la IP `152.207.206.86` desde datos móviles (en Wi-Fi siempre consume). Haz la primera prueba con un archivo pequeño (< 1 MB) revisando el saldo antes/después; si ETECSA cambia la IP, pasa `--ip <nueva_ip>` o `UDYAT_FREE_IP`.
+
 ## 📎 Aceptar archivos reenviados
 
 El bot ahora soporta dos formas de entrada:
@@ -391,6 +417,7 @@ El S3 por defecto es el público de toDus (`s3.todus.cu`, sin firma). Puedes cam
 20. `#filename=` como único mecanismo de nombre no funcionó en Android: verificado por el usuario que 1DM+/IDM al importar el .txt nombran cada descarga desde la COLA de la URL (y la URL oficial `get=` de toDus es opaca, ni nombre ni extensión; la documentación del SDK recomienda por eso pasar el nombre aparte). Ahora el nombre se garantiza en origen: en la vía anónima la key termina en el nombre legible (`<prefijo>/<user_id>/<rand8>/<nombre>`, sin acentos; la unicidad la da el segmento intermedio), y en la oficial el PUT prefirmado intenta fijar `Content-Disposition` con el nombre exacto, reintentando sin ella si el servidor la rechaza por no estar firmada (la verificación registra en el log la cabecera que devuelve el GET, para confirmar si toDus la sirve). El `#filename=` se mantiene como refuerzo inofensivo
 21. El procesamiento tardaba la suma de bajar (Telegram/URL→servidor) y subir (servidor→toDus), porque la subida empezaba solo con el archivo entero en disco. Ahora ambas fases se solapan (`STREAM_OVERLAP`): los PUT leen el temporal mientras crece a través de un cuerpo «follow» con `Content-Length` explícito —formato de red idéntico al PUT de siempre, sin `chunked` (verificado por captura: aiohttp con generador async + cabecera CL no usa chunked)—. Seguridad: una subida solapada solo puede terminar bien si la descarga escribió EXACTAMENTE el tamaño anunciado (el generador explota ante cualquier desviación, productor muerto o atasco >`STREAM_STALL_SECONDS`, y un PUT truncado no materializa el objeto); si el solape falla y la descarga acabó bien, se reintenta la subida clásica desde el disco, así que el peor caso es «como antes más un intento». No solapan: fotos de Telegram (sin tamaño previo), URLs sin `Content-Length` o con descarga paralela por rangos (partes sueltas) ni el modo firmado boto3 (espera al archivo completo)
 22. Los enlaces oficiales de VIDEO «no servían»: la reserva pedía el tipo por extensión (3=VIDEO) y toDus asignaba el `get=` bajo `todus/video/<fecha>/<hash>`, un prefijo que el bucket no sirve en anónimo (`AccessDenied`, verificado contra un enlace real de producción; la app y el SDK —`_needs_auth`/`_download_headers`— descargan esos objetos con `Authorization: Bearer`). Los de tipo archivo (`todus/file/...`) sí son públicos. La verificación oficial además trataba el 403 como «no verificable» y entregaba el enlace igual. Arreglo triple: (1) se reserva TODO como FILE (0) salvo `TODUS_UPLOAD_AS_FILE=0` — somos un bot de enlaces descargables, no un cliente de chat —; (2) 401/403 cuentan como muerto en la verificación; (3) ante un `get=` no descargable se pide la URL real vía `todus:gurl` (lo que la app hace siempre antes de descargar) y se verifica también esa; si tampoco sirve, la subida cae a la vía anónima. El usuario siempre recibe un enlace que descarga
+23. «Da error con la mayoría de las URL»: la descarga por URL era de un solo tiro y tres detalles la tumbaban en masa: (1) **aiohttp aplica por defecto un timeout `total=300s` a TODA la petición, cuerpo incluido** — cualquier archivo que tardara >5 min en bajar (enlaces lentos) moría a mitad con `TimeoutError`; ahora cada intento usa un timeout de transporte propio (`connect=30s`, silencio de lectura máx. 300s, sin límite total: la duración la sigue gobernando el `asyncio.timeout(1200)` exterior) y las partes de la descarga paralela también; (2) un corte de red, un 5xx/429 o una lectura incompleta eran error en seco para el usuario — ahora hay `URL_DOWNLOAD_RETRIES` (4) reintentos con backoff y **reanudación por `Range`** desde los bytes buenos ya en disco (un 200 que ignora el Range o un 416/206 con `Content-Range` ajeno reinician limpio desde 0; los 4xx definitivos como 403/404 siguen fallando al instante); (3) `Accept-Encoding` ofrecía `br` sin tener Brotli instalado — si el origen elegía Brotli el archivo se guardaba comprimido (basura) —, y las sondas HEAD no seguían redirecciones (tamaño 0 en URLs con 301/302 y mal modo elegido). Cubierto por tests con servidor inestable local (`scripts/test_flaky_download.py`, 6 casos) y por el harness de URLs reales (`scripts/test_url_download.py`)
 
 ## 🆘 Troubleshooting
 
