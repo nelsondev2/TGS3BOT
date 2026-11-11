@@ -313,6 +313,31 @@ El bot envía la **URL pública S3 como mensaje de texto**, que es ilimitado en 
 ```
 A partir de ese momento, el bot solo enviará URLs S3 (texto), no reenviará el archivo como media. Para desactivar, escribe `/textonly` otra vez.
 
+## 🆓 Script Python para descargar los enlaces sin gastar datos (UDYAT, Cuba)
+
+El repositorio incluye el script autónomo [`scripts/udyat_download.py`](scripts/udyat_download.py), sin dependencias externas (solo Python 3 estándar, ideal para **Termux** en Android o PC), que descarga los enlaces generados por el bot conectando por la IP interna de toDus (`152.207.206.86`) con las cabeceras `Host: s3.todus.cu` y `User-Agent: Wget/1.21.3`:
+
+```bash
+# 1. Probar si la IP interna responde desde tu conexión
+python scripts/udyat_download.py --test
+
+# 2. Descargar un enlace suelto (anónimo u oficial firmado)
+python scripts/udyat_download.py "https://s3.todus.cu/stream/..."
+
+# 3. Descargar todo un lote enlaces_*.txt del bot a Descargas (en Termux)
+python scripts/udyat_download.py enlaces_20261106_1200.txt -d ~/storage/downloads
+
+# 4. Acelerar archivos grandes con 4 hilos (soporta reanudación .part)
+python scripts/udyat_download.py -t 4 "https://s3.todus.cu/stream/..."
+```
+
+**Características:**
+- Respeta los nombres originales (`#filename=...` de los `enlaces_*.txt`, `Content-Disposition` o tipo MIME).
+- Reanuda descargas cortadas con `Range` (`.part`) y reintenta automáticamente ante cortes de red o `5xx`.
+- Bloquea por seguridad URLs ajenas a `s3.todus.cu` para no consumir tus datos por accidente (`--allow-direct` si quieres descargar otra URL).
+
+> ⚠️ **Nota importante:** que salga a **0 MB** depende de cómo clasifique hoy ETECSA la IP `152.207.206.86` desde datos móviles (en Wi-Fi siempre consume). Haz la primera prueba con un archivo pequeño (< 1 MB) revisando el saldo antes/después; si ETECSA cambia la IP, pasa `--ip <nueva_ip>` o `UDYAT_FREE_IP`.
+
 ## 📎 Aceptar archivos reenviados
 
 El bot ahora soporta dos formas de entrada:
