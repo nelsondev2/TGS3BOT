@@ -5,6 +5,7 @@ Bot de Telegram que escucha mensajes, descarga URLs enviadas por usuarios, las s
 ## ✨ Características
 
 - ✅ **Cliente Telethon** (soporta modo **bot oficial** con `BOT_TOKEN` o modo **userbot** con `SESSION_STRING`)
+- 🎬 **Soporte de YouTube (`yt-dlp` + `ffmpeg`)**: envía un enlace de YouTube (`youtube.com`, `youtu.be`, Shorts) y el bot descarga el video/audio y lo sube a toDus automáticamente, con soporte para elegir calidad (`/yt`, `/ytmp3`, `/ytquality`)
 - ✅ **La URL S3 siempre se muestra al usuario** (fix principal)
 - ✅ **Protección SSRF**: bloquea IPs privadas/loopback/link-local
 - ✅ **Allowlist de usuarios** opcional vía `ALLOWED_TG_IDS`
@@ -165,6 +166,11 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `S3_VERIFY_ATTEMPTS` | `6` | Intentos de la verificación HEAD (con backoff) |
 | `S3_ACCESS_KEY` | `public` | Key (si S3_UNSIGNED=0) |
 | `S3_SECRET_KEY` | `public` | Secret (si S3_UNSIGNED=0) |
+| `YT_ENABLED` | `1` | `1` = detectar enlaces de YouTube y descargarlos con `yt-dlp` |
+| `YT_DEFAULT_QUALITY` | `720` | Calidad por defecto para YouTube: `360`, `480`, `720`, `1080`, `best`, `audio` |
+| `YT_COOKIES` | *(vacío)* | Contenido Netscape `cookies.txt` opcional para evitar bloqueos anti-bot de YouTube en la nube |
+| `YT_COOKIES_FILE` | *(vacío)* | Ruta a un archivo `cookies.txt` en disco (alternativa a `YT_COOKIES`) |
+| `YT_DOWNLOAD_TIMEOUT` | `1200` | Tiempo máximo (s) para descargar un video de YouTube |
 
 Ver `.env.example` para referencia.
 
@@ -176,12 +182,15 @@ Ver `.env.example` para referencia.
 | `/cancel`, `cancelar` | Cancela tu trabajo en curso y vacía tu cola |
 | `/status` | Muestra cuántos trabajos tienes en curso o en cola |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
+| `/yt <URL>` | Muestra una botonera para elegir calidad (`360p`, `480p`, `720p`, `1080p`, `Máxima`, `Audio MP3`) y lo sube a S3 (también acepta `/yt <calidad> <URL>`) |
+| `/ytmp3 <URL>` | Descarga solo el audio de YouTube (MP3/M4A) y lo sube a S3 |
+| `/ytquality [calidad]` | Consulta o cambia tu calidad por defecto para enlaces de YouTube |
 | `/toduslogin <número>` | *(solo admin)* Login de la cuenta de toDus del bot por SMS (o `/toduslogin <número> <contraseña>`) |
 | `/toduscode <código>` | *(solo admin)* Completa el login por SMS (o responde solo con el código) |
 | `/todusstatus` | *(solo admin)* Estado de la sesión de toDus |
 | `/toduslogout` | *(solo admin)* Cierra la sesión de toDus (vuelve a la vía anónima) |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
-| `<URL>` | Procesa cualquier URL http/https |
+| `<URL>` | Procesa cualquier URL http/https (los enlaces de YouTube se descargan automáticamente con `yt-dlp`) |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3. Puedes reenviar **varios seguidos**: suben en cola, uno a uno, y al final recibes un `enlaces.txt` con todos los enlaces (y el nombre original de cada archivo) para IDM/1DM+ |
 
 ### Comportamiento por defecto (ahorra datos)

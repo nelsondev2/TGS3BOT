@@ -130,6 +130,16 @@ services:
       - key: ADMIN_TG_IDS
         # CSV de IDs que pueden usar /toduslogin en MODO BOT (en userbot, solo el dueño)
         sync: false
+      # === YouTube (yt-dlp) ===
+      - key: YT_ENABLED
+        # "1" = detectar enlaces de YouTube y descargarlos con yt-dlp antes de subir a toDus
+        value: "1"
+      - key: YT_DEFAULT_QUALITY
+        # Calidad por defecto: 360, 480, 720, 1080, best, audio
+        value: "720"
+      - key: YT_COOKIES
+        # Opcional: cookies Netscape (pegar texto) si YouTube pide verificación anti-bot
+        sync: false
     disk:
       # Disco para temporales y credenciales. OJO: Render solo crea
       # discos en planes de pago; con plan free este bloque NO crea
