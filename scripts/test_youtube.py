@@ -91,11 +91,31 @@ class TestYoutubeHelpers(unittest.TestCase):
         self.assertIsNotNone(exe)
         self.assertTrue(os.path.isfile(exe))
 
+    def test_find_deno(self):
+        exe = bot._find_deno()
+        self.assertIsNotNone(exe)
+        self.assertTrue(os.path.isfile(exe))
+
     def test_human_error(self):
         msg = bot._yt_human_error(RuntimeError("ERROR: [youtube] Sign in to confirm you're not a bot"))
-        self.assertIn("YT_COOKIES", msg)
+        self.assertIn("/ytcookies", msg)
         msg = bot._yt_human_error(RuntimeError("ERROR: [youtube] Private video"))
         self.assertIn("privado", msg)
+
+    def test_validate_netscape_cookies(self):
+        ok, err, cnt = bot._validate_netscape_cookies("texto cualquiera sin tabs")
+        self.assertFalse(ok)
+        self.assertEqual(cnt, 0)
+
+        ok, err, cnt = bot._validate_netscape_cookies(".example.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n")
+        self.assertFalse(ok)
+        self.assertIn("youtube.com", err)
+
+        sample = ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tVISITOR_INFO1_LIVE\tabc123\n"
+        ok, cleaned, cnt = bot._validate_netscape_cookies(sample)
+        self.assertTrue(ok)
+        self.assertEqual(cnt, 1)
+        self.assertIn("# Netscape HTTP Cookie File", cleaned)
 
 
 class TestProcessYoutubeAsync(unittest.IsolatedAsyncioTestCase):
@@ -182,6 +202,132 @@ class TestProcessYoutubeAsync(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("YouTube" in e and "Subido a S3" in e for e in self.edits))
         # El directorio temporal debe haberse limpiado
         self.assertEqual(os.listdir(self.tmpdir), [])
+
+    async def test_process_youtube_fallback_clients_on_bot_error(self):
+        seen_opts = []
+
+        class FallbackYDL:
+            def __init__(self, opts):
+                self.opts = opts
+                seen_opts.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def prepare_filename(self, info):
+                out_dir = os.path.dirname(self.opts["outtmpl"])
+                return os.path.join(out_dir, f"{info['id']}.{info['ext']}")
+
+            def extract_info(self, url, download=True):
+                if "extractor_args" not in self.opts:
+                    raise RuntimeError("ERROR: [youtube] Sign in to confirm you’re not a bot")
+                info = {
+                    "id": "fb123",
+                    "title": "Fallback OK",
+                    "ext": "mp4",
+                    "filesize": 512,
+                    "is_live": False,
+                }
+                self.opts["match_filter"](info, incomplete=False)
+                out_path = self.prepare_filename(info)
+                with open(out_path, "wb") as f:
+                    f.write(b"1" * 512)
+                return info
+
+        async def fake_subir(temp_path, filename, size, **kwargs):
+            return "https://s3.todus.cu/stream/fake/Fallback_OK.mp4", [], False
+
+        job = bot.QueuedJob(
+            user_id=7, kind="youtube",
+            url="https://youtu.be/fb123",
+            chat_id=7, status_msg=object(), yt_quality="720",
+        )
+        old_synced = bot._yt_cookies_env_synced
+        old_disabled = bot._yt_cookies_disabled_by_admin
+        bot._yt_cookies_env_synced = True
+        bot._yt_cookies_disabled_by_admin = True
+        try:
+            with patch.object(bot, "_is_safe_url", return_value=(True, None)), \
+                 patch.object(bot, "tg_edit_status", side_effect=self._fake_edit_status), \
+                 patch.object(bot, "tg_edit_quiet", side_effect=self._fake_edit_quiet), \
+                 patch.object(bot, "subir_a_s3", side_effect=fake_subir), \
+                 patch("yt_dlp.YoutubeDL", FallbackYDL):
+                await bot.process_job(job)
+        finally:
+            bot._yt_cookies_env_synced = old_synced
+            bot._yt_cookies_disabled_by_admin = old_disabled
+
+        self.assertEqual(len(seen_opts), 2)
+        self.assertNotIn("extractor_args", seen_opts[0])
+        self.assertIn("extractor_args", seen_opts[1])
+        self.assertEqual(job.result_url, "https://s3.todus.cu/stream/fake/Fallback_OK.mp4")
+
+    async def test_ytcookies_b64_and_telegram_command(self):
+        import base64
+        sample = ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\txyz\n"
+        b64 = base64.b64encode(sample.encode()).decode()
+
+        old_b64 = bot.YT_COOKIES_B64
+        old_synced = bot._yt_cookies_env_synced
+        old_disabled = bot._yt_cookies_disabled_by_admin
+        old_allowed = bot.ALLOWED_TG_IDS
+        old_admin = bot.ADMIN_TG_IDS
+        old_userbot = bot._is_userbot_mode
+        bot.YT_COOKIES_B64 = b64
+        bot._yt_cookies_env_synced = False
+        bot._yt_cookies_disabled_by_admin = False
+        bot.ALLOWED_TG_IDS = None
+        bot.ADMIN_TG_IDS = {999}
+        bot._is_userbot_mode = False
+        try:
+            p = bot._resolve_yt_cookiefile()
+            self.assertIsNotNone(p)
+            self.assertTrue(os.path.isfile(p))
+
+            class FakeSender:
+                id = 999
+                username = "admin"
+                first_name = "Admin"
+
+            class FakeMsg:
+                media = None
+
+            class FakeEvent:
+                def __init__(self, text):
+                    self.chat_id = 999
+                    self.raw_text = text
+                    self.message = FakeMsg()
+                    self.is_private = True
+                    self.replies = []
+
+                async def get_sender(self):
+                    return FakeSender()
+
+                async def respond(self, text, **kwargs):
+                    self.replies.append(text)
+
+            ev_st = FakeEvent("/ytcookies status")
+            await bot.on_tg_message(ev_st)
+            self.assertTrue(any("activas" in r for r in ev_st.replies))
+
+            ev_b64 = FakeEvent("/ytcookies b64")
+            await bot.on_tg_message(ev_b64)
+            self.assertTrue(any(b64 in r for r in ev_b64.replies))
+
+            ev_clr = FakeEvent("/ytcookies clear")
+            await bot.on_tg_message(ev_clr)
+            self.assertIsNone(bot._resolve_yt_cookiefile())
+        finally:
+            bot.YT_COOKIES_B64 = old_b64
+            bot._yt_cookies_env_synced = old_synced
+            bot._yt_cookies_disabled_by_admin = old_disabled
+            bot.ALLOWED_TG_IDS = old_allowed
+            bot.ADMIN_TG_IDS = old_admin
+            bot._is_userbot_mode = old_userbot
+            bot._yt_pending_cookies.clear()
 
     async def test_process_youtube_rejects_live_and_playlist(self):
         job_pl = bot.QueuedJob(

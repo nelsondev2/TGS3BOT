@@ -169,7 +169,9 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `YT_ENABLED` | `1` | `1` = detectar enlaces de YouTube y descargarlos con `yt-dlp` |
 | `YT_DEFAULT_QUALITY` | `720` | Calidad por defecto para YouTube: `360`, `480`, `720`, `1080`, `best`, `audio` |
 | `YT_COOKIES` | *(vacío)* | Contenido Netscape `cookies.txt` opcional para evitar bloqueos anti-bot de YouTube en la nube |
+| `YT_COOKIES_B64` | *(vacío)* | Igual que `YT_COOKIES` pero en Base64 (una línea, ideal para Render; obténlo con `/ytcookies b64`) |
 | `YT_COOKIES_FILE` | *(vacío)* | Ruta a un archivo `cookies.txt` en disco (alternativa a `YT_COOKIES`) |
+| `YT_PLAYER_CLIENTS` | *(vacío)* | CSV opcional de clientes de YouTube para `yt-dlp` (por defecto prueba fallback automático sin cookies) |
 | `YT_DOWNLOAD_TIMEOUT` | `1200` | Tiempo máximo (s) para descargar un video de YouTube |
 
 Ver `.env.example` para referencia.
@@ -185,6 +187,7 @@ Ver `.env.example` para referencia.
 | `/yt <URL>` | Muestra una botonera para elegir calidad (`360p`, `480p`, `720p`, `1080p`, `Máxima`, `Audio MP3`) y lo sube a S3 (también acepta `/yt <calidad> <URL>`) |
 | `/ytmp3 <URL>` | Descarga solo el audio de YouTube (MP3/M4A) y lo sube a S3 |
 | `/ytquality [calidad]` | Consulta o cambia tu calidad por defecto para enlaces de YouTube |
+| `/ytcookies [status\|clear\|b64]` | *(solo admin)* Carga `cookies.txt` de YouTube enviándolo por Telegram (evita el bloqueo anti-bot) |
 | `/toduslogin <número>` | *(solo admin)* Login de la cuenta de toDus del bot por SMS (o `/toduslogin <número> <contraseña>`) |
 | `/toduscode <código>` | *(solo admin)* Completa el login por SMS (o responde solo con el código) |
 | `/todusstatus` | *(solo admin)* Estado de la sesión de toDus |

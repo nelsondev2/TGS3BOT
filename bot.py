@@ -39,6 +39,7 @@ import shutil
 import asyncio
 import json
 import io
+import base64
 import logging
 import mimetypes
 import threading
@@ -288,6 +289,8 @@ YT_ENABLED = os.environ.get("YT_ENABLED", "1") == "1"
 YT_DEFAULT_QUALITY = os.environ.get("YT_DEFAULT_QUALITY", "720").strip().lower() or "720"
 YT_COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "").strip()
 YT_COOKIES = os.environ.get("YT_COOKIES", "").strip()
+YT_COOKIES_B64 = os.environ.get("YT_COOKIES_B64", "").strip()
+YT_PLAYER_CLIENTS = os.environ.get("YT_PLAYER_CLIENTS", "").strip()
 YT_DOWNLOAD_TIMEOUT = int(os.environ.get("YT_DOWNLOAD_TIMEOUT", "1200") or "1200")
 
 # --- HTTP Headers ---
@@ -763,6 +766,7 @@ def _render_help(is_userbot=False, is_admin=False):
             "  /toduscode 123456 — completar el login por SMS",
             "  /todusstatus — estado de la sesión de toDus",
             "  /toduslogout — cerrar sesión (vuelve a la vía anónima)",
+            "  /ytcookies — configurar cookies.txt de YouTube (anti-bot)",
         ])
     return "\n".join(lines)
 
@@ -3377,6 +3381,115 @@ _yt_user_quality = {}
 # Selecciones pendientes de botonera /yt <url>: token -> {"url", "user_id", "chat_id", "ts"}
 _yt_pending_choices = {}
 _YT_CHOICE_TTL = 1800  # 30 minutos
+# Admin esperando envío de cookies.txt: user_id -> ts
+_yt_pending_cookies = {}
+_YT_COOKIES_TTL = 300  # 5 minutos
+
+
+async def _read_event_cookies_text(event):
+    """Lee el texto de cookies desde un documento adjunto o texto del mensaje."""
+    msg = getattr(event, "message", None)
+    if msg and getattr(msg, "media", None):
+        doc = getattr(msg.media, "document", None)
+        if not doc:
+            return None, "Envía el archivo `cookies.txt` como documento."
+        if getattr(doc, "size", 0) > 1024 * 1024:
+            return None, "El archivo supera 1 MB y no parece un `cookies.txt`."
+        raw_bytes = await _tg_client.download_media(msg, bytes)
+        if not raw_bytes:
+            return None, "No se pudo descargar el archivo adjunto."
+        return raw_bytes.decode("utf-8", errors="replace"), None
+    return None, None
+
+
+async def _save_and_reply_ytcookies(event, sender_id, raw_text):
+    ok, res, count = _save_yt_cookies_text(raw_text)
+    if not ok:
+        await event.respond(f"{ICON_ERROR} {res}")
+        return
+    _yt_pending_cookies.pop(sender_id, None)
+    await event.respond(
+        f"{ICON_DONE} Cookies de YouTube cargadas ({count} entradas).\n\n"
+        "Ya puedes reintentar `/yt <enlace>`. "
+        "Si usas Render Free (sin disco persistente), puedes obtener el valor "
+        "para `YT_COOKIES_B64` enviando `/ytcookies b64` en chat privado."
+    )
+
+
+async def _handle_ytcookies_command(event, body, sender_id):
+    parts = (body or "").strip().split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    arg_low = arg.lower()
+
+    if arg_low == "status":
+        path = _resolve_yt_cookiefile()
+        if not path:
+            await event.respond("🍪 YouTube cookies: **sin configurar**.")
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = [l for l in f if l.strip() and not l.lstrip().startswith("#")]
+            await event.respond(
+                f"🍪 YouTube cookies: **activas** (`{len(lines)}` entradas)."
+            )
+        except Exception as e:
+            await event.respond(f"{ICON_ERROR} No se pudieron leer: {e}")
+        return
+
+    if arg_low == "clear":
+        _yt_pending_cookies.pop(sender_id, None)
+        _clear_yt_cookies()
+        await event.respond(f"{ICON_DONE} Cookies de YouTube eliminadas.")
+        return
+
+    if arg_low == "b64":
+        if not getattr(event, "is_private", False):
+            await event.respond(
+                "🔐 Por seguridad, pide `/ytcookies b64` solo en chat privado."
+            )
+            return
+        path = _resolve_yt_cookiefile()
+        if not path:
+            await event.respond("🍪 No hay cookies cargadas todavía.")
+            return
+        try:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            await event.respond(
+                "📋 Copia este valor en la variable `YT_COOKIES_B64` de Render "
+                "y borra este mensaje después:\n\n"
+                f"`{b64}`"
+            )
+        except Exception as e:
+            await event.respond(f"{ICON_ERROR} No se pudieron exportar: {e}")
+        return
+
+    # Caso 1: viene un archivo cookies.txt adjunto en el mismo mensaje
+    file_text, file_err = await _read_event_cookies_text(event)
+    if file_err:
+        await event.respond(f"{ICON_ERROR} {file_err}")
+        return
+    if file_text is not None:
+        await _save_and_reply_ytcookies(event, sender_id, file_text)
+        return
+
+    # Caso 2: pegó el contenido justo después de `/ytcookies`
+    if arg:
+        await _save_and_reply_ytcookies(event, sender_id, arg)
+        return
+
+    # Caso 3: `/ytcookies` solo -> esperar el próximo mensaje/archivo del admin
+    _yt_pending_cookies[sender_id] = time.time()
+    await event.respond(
+        "🍪 **Configurar cookies de YouTube**\n\n"
+        "1. En tu navegador (con sesión iniciada en YouTube), exporta `cookies.txt` "
+        "(p. ej. con la extensión *Get cookies.txt LOCALLY*).\n"
+        "2. **Envía aquí el archivo `cookies.txt`** (o pega su contenido) en los próximos 5 minutos.\n\n"
+        "Otros subcomandos:\n"
+        "  • `/ytcookies status` — ver estado actual\n"
+        "  • `/ytcookies clear` — borrar cookies\n"
+        "  • `/ytcookies b64` — exportar para `YT_COOKIES_B64` en Render"
+    )
 
 
 def _yt_prune_pending():
@@ -3476,28 +3589,152 @@ def _find_ffmpeg():
     return None
 
 
-def _resolve_yt_cookiefile():
-    """Devuelve ruta a cookies.txt si YT_COOKIES_FILE o YT_COOKIES están definidos."""
-    if YT_COOKIES_FILE and os.path.isfile(YT_COOKIES_FILE):
-        return YT_COOKIES_FILE
+def _find_deno():
+    """Localiza el binario deno (necesario para desafíos JS de YouTube)."""
+    exe = shutil.which("deno")
+    if exe:
+        return exe
+    try:
+        import deno
+        exe = deno.find_deno_bin()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+_YT_FALLBACK_CLIENTS = ["android_vr", "web_embedded", "tv_downgraded", "android", "ios"]
+_yt_cookies_env_synced = False
+_yt_cookies_disabled_by_admin = False
+
+
+def _yt_cookies_store_path():
+    return os.path.join(DOWNLOAD_PATH, "yt_cookies.txt")
+
+
+def _validate_netscape_cookies(raw_text):
+    """Valida y normaliza un cookies.txt en formato Netscape.
+
+    Devuelve (ok, cleaned_text_or_err, cookie_count).
+    """
+    if not raw_text or not str(raw_text).strip():
+        return False, "El contenido de cookies está vacío.", 0
+    text = str(raw_text).replace("\r\n", "\n").replace("\r", "\n")
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    lines = text.splitlines()
+    valid_rows = 0
+    has_yt_or_google = False
+    out_lines = []
+    saw_header = False
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if "netscape" in s.lower() or "http cookie file" in s.lower():
+                saw_header = True
+            out_lines.append(line)
+            continue
+        cols = line.split("\t")
+        if len(cols) >= 7:
+            valid_rows += 1
+            dom = cols[0].lower()
+            if "youtube" in dom or "google" in dom:
+                has_yt_or_google = True
+            out_lines.append(line)
+    if valid_rows == 0:
+        return (
+            False,
+            "No encontré cookies válidas en formato Netscape (`cookies.txt` con columnas separadas por tabulador).",
+            0,
+        )
+    if not has_yt_or_google:
+        return (
+            False,
+            "El archivo no contiene cookies de `youtube.com` ni `google.com`.",
+            0,
+        )
+    if not saw_header:
+        out_lines.insert(0, "# Netscape HTTP Cookie File")
+    return True, "\n".join(out_lines) + "\n", valid_rows
+
+
+def _save_yt_cookies_text(raw_text):
+    """Valida y guarda cookies Netscape en DOWNLOAD_PATH/yt_cookies.txt."""
+    global _yt_cookies_disabled_by_admin, _yt_cookies_env_synced
+    ok, res, count = _validate_netscape_cookies(raw_text)
+    if not ok:
+        return False, res, 0
+    path = _yt_cookies_store_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(res)
+        os.chmod(path, 0o600)
+        _yt_cookies_disabled_by_admin = False
+        _yt_cookies_env_synced = True
+        return True, path, count
+    except Exception as e:
+        return False, f"No se pudo guardar yt_cookies.txt: {e}", 0
+
+
+def _clear_yt_cookies():
+    global _yt_cookies_disabled_by_admin
+    _yt_cookies_disabled_by_admin = True
+    try:
+        os.unlink(_yt_cookies_store_path())
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"No se pudo borrar yt_cookies.txt: {e}")
+
+
+def _decode_yt_env_cookies():
+    if YT_COOKIES_B64:
+        try:
+            raw_bytes = base64.b64decode(YT_COOKIES_B64, validate=False)
+            return raw_bytes.decode("utf-8", errors="replace"), "YT_COOKIES_B64"
+        except Exception as e:
+            log.warning(f"YT_COOKIES_B64 inválido: {e}")
     if YT_COOKIES:
-        cookie_path = os.path.join(DOWNLOAD_PATH, "yt_cookies.txt")
         raw = YT_COOKIES
         if "\\n" in raw and "\n" not in raw:
             raw = raw.replace("\\n", "\n")
-        try:
-            current = None
-            if os.path.exists(cookie_path):
-                with open(cookie_path, "r", encoding="utf-8") as f:
-                    current = f.read()
-            if current != raw:
-                with open(cookie_path, "w", encoding="utf-8") as f:
-                    f.write(raw)
-                os.chmod(cookie_path, 0o600)
-            return cookie_path
-        except Exception as e:
-            log.warning(f"No se pudo escribir yt_cookies.txt: {e}")
+        return raw, "YT_COOKIES"
+    return None, None
+
+
+def _resolve_yt_cookiefile():
+    """Devuelve ruta a cookies.txt si hay cookies configuradas (archivo, Telegram o env)."""
+    global _yt_cookies_env_synced
+    if YT_COOKIES_FILE and os.path.isfile(YT_COOKIES_FILE):
+        return YT_COOKIES_FILE
+    if _yt_cookies_disabled_by_admin:
+        return None
+    cookie_path = _yt_cookies_store_path()
+    if not _yt_cookies_env_synced:
+        _yt_cookies_env_synced = True
+        if not os.path.isfile(cookie_path):
+            raw, src = _decode_yt_env_cookies()
+            if raw:
+                try:
+                    os.makedirs(os.path.dirname(cookie_path), exist_ok=True)
+                    with open(cookie_path, "w", encoding="utf-8") as f:
+                        f.write(raw)
+                    os.chmod(cookie_path, 0o600)
+                    log.info(f"YouTube: cookies cargadas desde {src}")
+                except Exception as e:
+                    log.warning(f"No se pudo escribir yt_cookies.txt: {e}")
+    if os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
+        return cookie_path
     return None
+
+
+def _is_yt_bot_error(err):
+    low = str(err or "").lower()
+    return ("not a bot" in low) or ("sign in to confirm" in low and "bot" in low)
 
 
 def _build_yt_format_opts(quality, has_ffmpeg):
@@ -3552,10 +3789,11 @@ def _yt_estimate_size(info):
 def _yt_human_error(err):
     msg = str(err or "").strip()
     low = msg.lower()
-    if "not a bot" in low or "sign in to confirm" in low and "bot" in low:
+    if _is_yt_bot_error(err):
         return (
             "YouTube pidió verificación anti-bot desde este servidor. "
-            "Configura YT_COOKIES o YT_COOKIES_FILE e inténtalo de nuevo."
+            "Si eres admin, envía /ytcookies (con tu cookies.txt) o configura "
+            "YT_COOKIES_B64 / YT_COOKIES en Render e inténtalo de nuevo."
         )
     if "private video" in low:
         return "El video de YouTube es privado."
@@ -3646,6 +3884,7 @@ async def _process_youtube(job):
         or "720"
     )
     ffmpeg_exe = _find_ffmpeg()
+    deno_exe = _find_deno()
     fmt_spec, postprocessors, merge_fmt, expected_ext = _build_yt_format_opts(
         quality, bool(ffmpeg_exe)
     )
@@ -3781,33 +4020,64 @@ async def _process_youtube(job):
         }
         if ffmpeg_exe:
             ydl_opts["ffmpeg_location"] = ffmpeg_exe
+        if deno_exe:
+            ydl_opts["js_runtimes"] = {"deno": {"path": deno_exe}}
         if merge_fmt:
             ydl_opts["merge_output_format"] = merge_fmt
         if postprocessors:
             ydl_opts["postprocessors"] = postprocessors
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
+        if YT_PLAYER_CLIENTS:
+            clients = [c.strip() for c in YT_PLAYER_CLIENTS.split(",") if c.strip()]
+            if clients:
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+
+        def _run_ydl(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if meta["reject_reason"]:
+                    raise RuntimeError(meta["reject_reason"])
+                if not isinstance(info, dict):
+                    raise RuntimeError("No se pudo obtener información del video.")
+                if info.get("_type") in ("playlist", "multi_video") or "entries" in info:
+                    raise RuntimeError("Solo se admiten videos individuales de YouTube (no listas).")
+                candidates = [meta["final_path"]]
+                rd = info.get("requested_downloads") or []
+                for item in rd:
+                    if isinstance(item, dict) and item.get("filepath"):
+                        candidates.append(item["filepath"])
+                try:
+                    candidates.append(ydl.prepare_filename(info))
+                except Exception:
+                    pass
+                return info, candidates
 
         def _download_sync():
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if meta["reject_reason"]:
-                        raise RuntimeError(meta["reject_reason"])
-                    if not isinstance(info, dict):
-                        raise RuntimeError("No se pudo obtener información del video.")
-                    if info.get("_type") in ("playlist", "multi_video") or "entries" in info:
-                        raise RuntimeError("Solo se admiten videos individuales de YouTube (no listas).")
-                    candidates = [meta["final_path"]]
-                    rd = info.get("requested_downloads") or []
-                    for item in rd:
-                        if isinstance(item, dict) and item.get("filepath"):
-                            candidates.append(item["filepath"])
-                    try:
-                        candidates.append(ydl.prepare_filename(info))
-                    except Exception:
-                        pass
-                    return info, candidates
+                try:
+                    return _run_ydl(ydl_opts)
+                except Exception as first_err:
+                    # Sin cookies, algunos clientes web/tv disparan el anti-bot en IPs
+                    # de datacenter: reintentamos automáticamente con clientes móviles/embebidos.
+                    if (
+                        not cookiefile
+                        and not YT_PLAYER_CLIENTS
+                        and not job.cancel_requested
+                        and _is_yt_bot_error(first_err)
+                    ):
+                        log.info(
+                            "YouTube pidió anti-bot sin cookies; reintentando con "
+                            f"clientes alternativos {_YT_FALLBACK_CLIENTS}"
+                        )
+                        meta["reject_reason"] = None
+                        meta["final_path"] = None
+                        fallback_opts = dict(ydl_opts)
+                        fallback_opts["extractor_args"] = {
+                            "youtube": {"player_client": list(_YT_FALLBACK_CLIENTS)}
+                        }
+                        return _run_ydl(fallback_opts)
+                    raise
             finally:
                 if job.cancel_requested:
                     shutil.rmtree(yt_dir, ignore_errors=True)
@@ -4334,6 +4604,33 @@ async def on_tg_message(event):
 
             await job_queue.enqueue(job, _factory_yt_cmd)
             return
+
+        # ===== YOUTUBE: cookies (solo admin) =====
+        if cmd_word == "/ytcookies":
+            if not _is_admin(sender_id):
+                await event.respond(
+                    f"{ICON_ERROR} Solo el administrador del bot puede "
+                    "configurar las cookies de YouTube."
+                )
+                return
+            await _handle_ytcookies_command(event, body, sender_id)
+            return
+
+        # Capturar cookies.txt enviado tras `/ytcookies` (antes de detectar media/URL)
+        _yt_ck_ts = _yt_pending_cookies.get(sender_id)
+        if _yt_ck_ts and _is_admin(sender_id):
+            if time.time() - _yt_ck_ts > _YT_COOKIES_TTL:
+                _yt_pending_cookies.pop(sender_id, None)
+            elif event.message and event.message.media:
+                file_text, file_err = await _read_event_cookies_text(event)
+                if file_err:
+                    await event.respond(f"{ICON_ERROR} {file_err}")
+                elif file_text is not None:
+                    await _save_and_reply_ytcookies(event, sender_id, file_text)
+                return
+            elif body and ("\t" in body or "netscape" in low or "http cookie file" in low) and not URL_RE.search(body):
+                await _save_and_reply_ytcookies(event, sender_id, body)
+                return
 
         # ===== CUENTA DE TODUS (solo admin) =====
         if low.startswith(("/toduslogin", "/toduscode")) or low in (
