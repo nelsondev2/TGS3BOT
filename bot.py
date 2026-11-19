@@ -35,6 +35,7 @@ import re
 import time
 import uuid
 import signal
+import shutil
 import asyncio
 import json
 import io
@@ -54,7 +55,7 @@ from botocore.config import Config as BotoConfig
 from boto3.s3.transfer import TransferConfig
 
 # Telethon: cliente de Telegram
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
@@ -281,6 +282,14 @@ ADMIN_TG_IDS = (
     if _admin_env else None
 )
 
+# --- YouTube (yt-dlp) ---
+YT_ENABLED = os.environ.get("YT_ENABLED", "1") == "1"
+# Calidad por defecto: "360", "480", "720", "1080", "best", "audio"
+YT_DEFAULT_QUALITY = os.environ.get("YT_DEFAULT_QUALITY", "720").strip().lower() or "720"
+YT_COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "").strip()
+YT_COOKIES = os.environ.get("YT_COOKIES", "").strip()
+YT_DOWNLOAD_TIMEOUT = int(os.environ.get("YT_DOWNLOAD_TIMEOUT", "1200") or "1200")
+
 # --- HTTP Headers ---
 # OJO con Accept-Encoding: aiohttp solo decodifica gzip/deflate por
 # sí mismo; 'br' (Brotli) requiere el paquete brotli, que NO está en
@@ -386,11 +395,12 @@ class QueuedJob:
         "job_id", "user_id", "kind", "url", "original_name",
         "task", "created_at", "cancel_requested", "temp_paths",
         "status_msg", "chat_id", "message",
-        "result_url", "result_name",
+        "result_url", "result_name", "yt_quality",
     )
 
     def __init__(self, user_id, kind, url=None, original_name=None,
-                 chat_id=None, status_msg=None, message=None):
+                 chat_id=None, status_msg=None, message=None,
+                 yt_quality=None):
         self.job_id = uuid.uuid4().hex
         self.user_id = user_id
         self.kind = kind
@@ -407,6 +417,7 @@ class QueuedJob:
         # y el guardián anti-barrido puede actualizar result_url.
         self.result_url = None
         self.result_name = None
+        self.yt_quality = yt_quality
 
 
 class UserJobQueue:
@@ -673,6 +684,8 @@ def _render_status_progress(step, filename=None, size=None, pct=None):
     icons = {"downloading": f"{ICON_PROCESSING} Descargando",
              "uploading": f"{ICON_PROCESSING} Subiendo",
              "receiving": f"{ICON_PROCESSING} Recibiendo",
+             "extracting": f"{ICON_PROCESSING} Obteniendo info",
+             "converting": f"{ICON_PROCESSING} Procesando",
              "verifying": f"{ICON_PROCESSING} Verificando enlace"}
     base = icons.get(step, f"{ICON_PROCESSING} Procesando")
     if pct is not None:
@@ -719,7 +732,7 @@ def _render_help(is_userbot=False, is_admin=False):
         f"🤖 **Bot S3** — sube archivos a la nube y te devuelve el enlace",
         "",
         "¿Qué puedo hacer?",
-        f"  • Envía un enlace `http(s)://...` y lo subo",
+        f"  • Envía un enlace `http(s)://...` (incluidos enlaces de YouTube) y lo subo",
         f"  • Reenvía un archivo (foto, video, audio, doc) y lo subo",
         "",
         "Por defecto solo te envío la **URL** como texto (ahorra datos en toDus).",
@@ -732,6 +745,9 @@ def _render_help(is_userbot=False, is_admin=False):
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
+        "  /yt URL — elige calidad con botones (`360p|480p|720p|1080p|máxima|audio`)",
+        "  /ytmp3 URL — descarga solo audio de YouTube",
+        "  /ytquality [calidad] — define tu calidad por defecto para enlaces directos",
     ]
     if is_userbot:
         lines.extend([
@@ -2767,6 +2783,8 @@ async def _download_then_upload(produce, temp_path, filename, size_hint, *,
 async def process_job(job):
     if job.kind == "tg_media":
         await _process_tg_media(job)
+    elif job.kind == "youtube":
+        await _process_youtube(job)
     else:
         await _process_url(job)
 
@@ -3346,6 +3364,605 @@ async def _process_url(job):
         job.temp_paths.clear()
 
 
+# ============== YOUTUBE (yt-dlp → toDus) ==============
+_YT_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "music.youtube.com", "gaming.youtube.com",
+    "youtu.be", "www.youtu.be",
+    "youtube-nocookie.com", "www.youtube-nocookie.com",
+}
+_YT_VALID_QUALITIES = {"360", "480", "720", "1080", "best", "audio"}
+# Preferencia de calidad por usuario (en memoria, igual que _sendfile_users)
+_yt_user_quality = {}
+# Selecciones pendientes de botonera /yt <url>: token -> {"url", "user_id", "chat_id", "ts"}
+_yt_pending_choices = {}
+_YT_CHOICE_TTL = 1800  # 30 minutos
+
+
+def _yt_prune_pending():
+    now = time.time()
+    expired = [k for k, v in _yt_pending_choices.items() if now - v.get("ts", 0) > _YT_CHOICE_TTL]
+    for k in expired:
+        _yt_pending_choices.pop(k, None)
+
+
+def _build_yt_quality_buttons(token):
+    return [
+        [
+            Button.inline("360p", f"yt:{token}:360".encode()),
+            Button.inline("480p", f"yt:{token}:480".encode()),
+        ],
+        [
+            Button.inline("720p", f"yt:{token}:720".encode()),
+            Button.inline("1080p", f"yt:{token}:1080".encode()),
+        ],
+        [
+            Button.inline("⭐ Máxima", f"yt:{token}:best".encode()),
+            Button.inline("🎵 Audio MP3", f"yt:{token}:audio".encode()),
+        ],
+        [
+            Button.inline("✗ Cancelar", f"yt:{token}:cancel".encode()),
+        ],
+    ]
+
+
+class _YtCancelled(Exception):
+    """Aborta yt-dlp desde progress_hook cuando el usuario hace /cancel."""
+
+
+class _YtTooLarge(Exception):
+    """Aborta yt-dlp si el tamaño supera MAX_FILE_SIZE."""
+
+
+def _normalize_yt_quality(val):
+    if not val:
+        return None
+    q = str(val).strip().lower()
+    if q.endswith("p") and q[:-1].isdigit():
+        q = q[:-1]
+    if q in ("mp3", "m4a", "aac"):
+        q = "audio"
+    elif q in ("max", "mejor", "alta"):
+        q = "best"
+    return q if q in _YT_VALID_QUALITIES else None
+
+
+def _is_youtube_url(url):
+    if not url:
+        return False
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower().rstrip(".")
+    if host not in _YT_HOSTS:
+        return False
+    if host in ("youtu.be", "www.youtu.be"):
+        return bool(p.path.strip("/"))
+    return True
+
+
+def _is_youtube_collection_url(url):
+    """Detecta listas de reproducción o canales (no videos sueltos)."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    host = (p.hostname or "").lower().rstrip(".")
+    if host in ("youtu.be", "www.youtu.be"):
+        return False
+    path = (p.path or "/").lower()
+    if path in ("/", "") and not p.query:
+        return True
+    if path.startswith(("/playlist", "/@", "/channel/", "/c/", "/user/")):
+        return True
+    return False
+
+
+def _find_ffmpeg():
+    """Localiza ffmpeg en PATH o mediante imageio-ffmpeg."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_yt_cookiefile():
+    """Devuelve ruta a cookies.txt si YT_COOKIES_FILE o YT_COOKIES están definidos."""
+    if YT_COOKIES_FILE and os.path.isfile(YT_COOKIES_FILE):
+        return YT_COOKIES_FILE
+    if YT_COOKIES:
+        cookie_path = os.path.join(DOWNLOAD_PATH, "yt_cookies.txt")
+        raw = YT_COOKIES
+        if "\\n" in raw and "\n" not in raw:
+            raw = raw.replace("\\n", "\n")
+        try:
+            current = None
+            if os.path.exists(cookie_path):
+                with open(cookie_path, "r", encoding="utf-8") as f:
+                    current = f.read()
+            if current != raw:
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.write(raw)
+                os.chmod(cookie_path, 0o600)
+            return cookie_path
+        except Exception as e:
+            log.warning(f"No se pudo escribir yt_cookies.txt: {e}")
+    return None
+
+
+def _build_yt_format_opts(quality, has_ffmpeg):
+    """Construye (format_spec, postprocessors, merge_output_format, expected_ext)."""
+    q = _normalize_yt_quality(quality) or "720"
+    if q == "audio":
+        if has_ffmpeg:
+            return (
+                "bestaudio/best",
+                [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                None,
+                ".mp3",
+            )
+        return (
+            "bestaudio[ext=m4a]/bestaudio/best",
+            [],
+            None,
+            ".m4a",
+        )
+
+    hf = "" if q == "best" else f"[height<={q}]"
+    if has_ffmpeg:
+        fmt = (
+            f"bestvideo{hf}[ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo{hf}+bestaudio/"
+            f"best{hf}[ext=mp4]/best{hf}/best"
+        )
+        return fmt, [], "mp4", ".mp4"
+
+    fmt = f"best{hf}[ext=mp4]/best{hf}/best[ext=mp4]/best"
+    return fmt, [], None, ".mp4"
+
+
+def _yt_estimate_size(info):
+    if not isinstance(info, dict):
+        return 0
+    rf = info.get("requested_formats")
+    if isinstance(rf, list) and rf:
+        total = 0
+        for f in rf:
+            if isinstance(f, dict):
+                total += int(f.get("filesize") or f.get("filesize_approx") or 0)
+        if total > 0:
+            return total
+    return int(info.get("filesize") or info.get("filesize_approx") or 0)
+
+
+def _yt_human_error(err):
+    msg = str(err or "").strip()
+    low = msg.lower()
+    if "not a bot" in low or "sign in to confirm" in low and "bot" in low:
+        return (
+            "YouTube pidió verificación anti-bot desde este servidor. "
+            "Configura YT_COOKIES o YT_COOKIES_FILE e inténtalo de nuevo."
+        )
+    if "private video" in low:
+        return "El video de YouTube es privado."
+    if "video unavailable" in low or "this video is unavailable" in low:
+        return "El video de YouTube no está disponible."
+    if "age-restricted" in low or "confirm your age" in low:
+        return "Video con restricción de edad (requiere YT_COOKIES)."
+    if "live event will begin" in low or "premieres in" in low:
+        return "El video es un estreno o directo futuro y aún no está disponible."
+    if "requested format is not available" in low:
+        return "La calidad solicitada no está disponible para este video."
+    clean = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", msg).strip()
+    return (clean or "Error descargando de YouTube")[:200]
+
+
+def _yt_find_downloaded_file(yt_dir, candidates=()):
+    """Localiza el archivo final descargado en yt_dir."""
+    for p in candidates:
+        if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    if not os.path.isdir(yt_dir):
+        return None
+    best_path = None
+    best_size = -1
+    for entry in os.scandir(yt_dir):
+        if not entry.is_file():
+            continue
+        name = entry.name.lower()
+        if name.endswith((".part", ".ytdl", ".temp", ".tmp")):
+            continue
+        try:
+            st = entry.stat()
+        except OSError:
+            continue
+        if st.st_size > best_size:
+            best_size = st.st_size
+            best_path = entry.path
+    return best_path if best_size > 0 else None
+
+
+def _yt_quality_label(q):
+    if q == "audio":
+        return "audio (MP3/M4A)"
+    if q == "best":
+        return "máxima disponible"
+    return f"{q}p"
+
+
+async def _process_youtube(job):
+    """Descarga un video/audio de YouTube con yt-dlp y lo sube a toDus/S3."""
+    url = job.url
+    chat_id = job.chat_id
+    status_msg = job.status_msg
+
+    if not YT_ENABLED:
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_error("Las descargas de YouTube están desactivadas (YT_ENABLED=0).")
+        )
+        return
+
+    safe, err = _is_safe_url(url)
+    if not safe:
+        log.warning(f"SSRF bloqueado (YouTube): {url} - {err}")
+        await tg_edit_status(chat_id, status_msg, _render_error(f"URL no permitida: {err}"))
+        return
+
+    if _is_youtube_collection_url(url):
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_error("Envía el enlace de un video individual de YouTube (no listas ni canales).")
+        )
+        return
+
+    try:
+        import yt_dlp
+    except ImportError:
+        await tg_edit_status(
+            chat_id, status_msg,
+            _render_error("yt-dlp no está instalado en el servidor.")
+        )
+        return
+
+    quality = (
+        _normalize_yt_quality(job.yt_quality)
+        or _yt_user_quality.get(job.user_id)
+        or _normalize_yt_quality(YT_DEFAULT_QUALITY)
+        or "720"
+    )
+    ffmpeg_exe = _find_ffmpeg()
+    fmt_spec, postprocessors, merge_fmt, expected_ext = _build_yt_format_opts(
+        quality, bool(ffmpeg_exe)
+    )
+    cookiefile = _resolve_yt_cookiefile()
+
+    yt_dir = os.path.join(DOWNLOAD_PATH, f"yt_{job.job_id[:12]}")
+    os.makedirs(yt_dir, exist_ok=True)
+    loop = asyncio.get_running_loop()
+
+    try:
+        check_disk_space()
+
+        status_msg = await tg_edit_status(
+            chat_id, status_msg,
+            _render_status_progress("extracting", f"YouTube ({_yt_quality_label(quality)})")
+        )
+
+        async def _emit_dl(pct):
+            label = meta["display_name"] or "YouTube"
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress("downloading", label, meta["est_size"] or None, pct)
+            )
+
+        dl_progress = _ThrottledProgress(_emit_dl)
+
+        def _schedule_async(coro_factory):
+            if loop.is_closed():
+                return
+
+            def _runner():
+                try:
+                    t = asyncio.create_task(coro_factory())
+                    t.add_done_callback(lambda fut: fut.exception() if not fut.cancelled() else None)
+                except Exception:
+                    pass
+
+            try:
+                loop.call_soon_threadsafe(_runner)
+            except RuntimeError:
+                pass
+
+        meta = {
+            "title": None,
+            "display_name": None,
+            "est_size": 0,
+            "reject_reason": None,
+            "final_path": None,
+            "last_hook_ts": 0.0,
+        }
+
+        def _match_filter(info, *, incomplete=False):
+            if job.cancel_requested:
+                raise _YtCancelled()
+            if info.get("_type") in ("playlist", "multi_video") or "entries" in info:
+                meta["reject_reason"] = "Solo se admiten videos individuales de YouTube (no listas)."
+                return meta["reject_reason"]
+            if info.get("is_live"):
+                meta["reject_reason"] = "Las transmisiones en vivo de YouTube no se pueden descargar."
+                return meta["reject_reason"]
+            est = _yt_estimate_size(info)
+            if est and est > MAX_FILE_SIZE:
+                meta["reject_reason"] = (
+                    f"Video de {format_size(est)} — supera el límite ({format_size(MAX_FILE_SIZE)})"
+                )
+                return meta["reject_reason"]
+            title = info.get("title") or info.get("id") or "youtube_video"
+            meta["title"] = title
+            meta["est_size"] = est
+            meta["display_name"] = f"{sanitize_filename(title)[:80]}{expected_ext}"
+            _schedule_async(
+                lambda dn=meta["display_name"], sz=(est or None): tg_edit_quiet(
+                    chat_id, status_msg,
+                    _render_status_progress("downloading", dn, sz)
+                )
+            )
+            return None
+
+        def _progress_hook(d):
+            if job.cancel_requested:
+                raise _YtCancelled()
+            st = d.get("status")
+            if st == "downloading":
+                downloaded = int(d.get("downloaded_bytes") or 0)
+                total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                if downloaded > MAX_FILE_SIZE or (total and total > MAX_FILE_SIZE):
+                    raise _YtTooLarge(
+                        f"El archivo supera el límite ({format_size(MAX_FILE_SIZE)})"
+                    )
+                now = time.monotonic()
+                if total > 0 and (now - meta["last_hook_ts"] >= 0.8 or downloaded >= total):
+                    meta["last_hook_ts"] = now
+                    _schedule_async(
+                        lambda dn=downloaded, tt=total: dl_progress.report(dn, tt)
+                    )
+            elif st == "finished":
+                fn = d.get("filename")
+                if fn:
+                    meta["final_path"] = fn
+
+        def _postprocessor_hook(d):
+            if job.cancel_requested:
+                raise _YtCancelled()
+            st = d.get("status")
+            if st == "started":
+                dn = meta["display_name"] or "YouTube"
+                _schedule_async(
+                    lambda name=dn: tg_edit_quiet(
+                        chat_id, status_msg,
+                        _render_status_progress("converting", name)
+                    )
+                )
+            elif st == "finished":
+                fp = (d.get("info_dict") or {}).get("filepath")
+                if fp:
+                    meta["final_path"] = fp
+
+        ydl_opts = {
+            "format": fmt_spec,
+            "outtmpl": os.path.join(yt_dir, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "retries": 3,
+            "fragment_retries": 5,
+            "concurrent_fragment_downloads": 4,
+            "socket_timeout": 30,
+            "overwrites": True,
+            "match_filter": _match_filter,
+            "progress_hooks": [_progress_hook],
+            "postprocessor_hooks": [_postprocessor_hook],
+        }
+        if ffmpeg_exe:
+            ydl_opts["ffmpeg_location"] = ffmpeg_exe
+        if merge_fmt:
+            ydl_opts["merge_output_format"] = merge_fmt
+        if postprocessors:
+            ydl_opts["postprocessors"] = postprocessors
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+
+        def _download_sync():
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if meta["reject_reason"]:
+                        raise RuntimeError(meta["reject_reason"])
+                    if not isinstance(info, dict):
+                        raise RuntimeError("No se pudo obtener información del video.")
+                    if info.get("_type") in ("playlist", "multi_video") or "entries" in info:
+                        raise RuntimeError("Solo se admiten videos individuales de YouTube (no listas).")
+                    candidates = [meta["final_path"]]
+                    rd = info.get("requested_downloads") or []
+                    for item in rd:
+                        if isinstance(item, dict) and item.get("filepath"):
+                            candidates.append(item["filepath"])
+                    try:
+                        candidates.append(ydl.prepare_filename(info))
+                    except Exception:
+                        pass
+                    return info, candidates
+            finally:
+                if job.cancel_requested:
+                    shutil.rmtree(yt_dir, ignore_errors=True)
+
+        async with asyncio.timeout(YT_DOWNLOAD_TIMEOUT):
+            info, candidates = await asyncio.to_thread(_download_sync)
+
+        temp_path = _yt_find_downloaded_file(yt_dir, candidates)
+        if not temp_path:
+            raise RuntimeError("No se encontró el archivo descargado de YouTube.")
+
+        job.temp_paths.append(temp_path)
+        size = os.path.getsize(temp_path)
+        if size <= 0:
+            raise RuntimeError("El archivo descargado está vacío.")
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(
+                f"Archivo de {format_size(size)} — supera el límite ({format_size(MAX_FILE_SIZE)})"
+            )
+
+        real_ext = os.path.splitext(temp_path)[1].lower() or expected_ext
+        title = meta["title"] or info.get("title") or info.get("id") or f"youtube_{int(time.time())}"
+        filename = f"{sanitize_filename(title)[:100]}{real_ext}"
+
+        status_msg = await tg_edit_status(
+            chat_id, status_msg,
+            _render_status_progress("uploading", filename, size)
+        )
+
+        async def _s3_status(text):
+            nonlocal status_msg
+            status_msg = await tg_edit_status(chat_id, status_msg, text)
+
+        async def _emit_up(pct):
+            await tg_edit_quiet(
+                chat_id, status_msg,
+                _render_status_progress("uploading", filename, size, pct)
+            )
+
+        up_progress = _ThrottledProgress(_emit_up)
+
+        send_file = (job.user_id in _sendfile_users) and SEND_FILE_VIA_TG
+
+        async def _repair(alive_urls):
+            nonlocal status_msg
+            if not alive_urls:
+                job.result_url = None
+                status_msg = await tg_edit_status(
+                    chat_id, status_msg,
+                    _render_error(
+                        f"El servidor eliminó «{filename}» a los pocos "
+                        "minutos de subirlo (barrido de toDus). "
+                        "Reenvíalo, por favor."
+                    )
+                )
+                return
+            job.result_url = alive_urls[0]
+            changed = (
+                alive_urls[0] != url_final
+                or (alive_urls[1:2] or [None])[0] != url_espejo
+            )
+            if send_file and not changed:
+                return
+            note_rep = (
+                "↻ enlace actualizado: el anterior fue borrado por el servidor"
+                if alive_urls[0] != url_final else None
+            )
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size,
+                    s3_url=alive_urls[0],
+                    mirror_url=alive_urls[1] if len(alive_urls) > 1 else None,
+                    source="YouTube", note=note_rep
+                )
+            )
+
+        url_final, _url_espejos, _pending = await subir_a_s3(
+            temp_path, filename, size, user_id=job.user_id,
+            status_cb=_s3_status, progress_cb=up_progress.report,
+            repair_cb=_repair,
+        )
+        url_espejo = _url_espejos[0] if _url_espejos else None
+        _note = ("⏳ comprobando que el enlace sobrevive…"
+                 if _pending else None)
+        job.result_url = url_final
+        job.result_name = filename
+
+        name = os.path.splitext(filename)[0].replace("_", " ")
+        ext_out = os.path.splitext(filename)[1].replace(".", "")
+
+        if not send_file:
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    mirror_url=url_espejo, source="YouTube", note=_note
+                )
+            )
+            job.status_msg = status_msg
+            log.info(f"OK YouTube subido a S3 (textonly) para {chat_id}: {filename}")
+            return
+
+        caption = _render_result_card(
+            name=name, ext=ext_out, size=size, s3_url=url_final,
+            mirror_url=url_espejo, source="YouTube"
+        )
+        tipo, send_err = await _send_file_via_telegram(
+            chat_id, temp_path, filename, size, caption
+        )
+        if tipo:
+            log.info(f"OK YouTube enviado {tipo} a {chat_id}: {filename}")
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                f"{ICON_DONE} Enviado como {_tipo_label(tipo)} · {format_size(size)}"
+            )
+        else:
+            err_msg = f"No se pudo enviar como media: {send_err or 'desconocido'}"
+            status_msg = await tg_edit_status(
+                chat_id, status_msg,
+                _render_result_card(
+                    name=name, ext=ext_out, size=size, s3_url=url_final,
+                    mirror_url=url_espejo, source="YouTube", note=_note
+                ) + f"\n\n{_render_error(err_msg)}"
+            )
+        job.status_msg = status_msg
+
+    except (asyncio.CancelledError, _YtCancelled):
+        job.cancel_requested = True
+        try:
+            await tg_edit_status(chat_id, status_msg, _render_cancel())
+        except Exception:
+            pass
+        raise asyncio.CancelledError()
+    except _YtTooLarge as e:
+        try:
+            await tg_edit_status(chat_id, status_msg, _render_error(str(e)))
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("error procesando YouTube")
+        err_text = _yt_human_error(e)
+        try:
+            await tg_edit_status(
+                chat_id, status_msg,
+                _render_error(err_text)
+            )
+        except Exception:
+            pass
+    finally:
+        cleanup_paths(job.temp_paths)
+        job.temp_paths.clear()
+        shutil.rmtree(yt_dir, ignore_errors=True)
+
+
 # ============== TELEGRAM EVENT HANDLERS ==============
 # Usuarios que han activado /sendfile (recibir el archivo además de la URL)
 # Por defecto el bot SOLO envía la URL (ahorra datos en toDus).
@@ -3525,11 +4142,48 @@ async def _handle_todus_command(event, body, sender_id):
         "/todusstatus · /toduslogout")
 
 
+def _parse_yt_command(body):
+    """Parsea /yt, /ytmp3, /ytaudio.
+
+    Devuelve (url, quality) o (None, error_msg).
+    """
+    parts = (body or "").strip().split()
+    if not parts:
+        return None, "Uso: /yt [360|480|720|1080|best|audio] <enlace_youtube>"
+    cmd = parts[0].lower().split("@", 1)[0]
+    rest = parts[1:]
+
+    url_match = URL_RE.search(body or "")
+    url = url_match.group(1) if url_match else None
+
+    if cmd in ("/ytmp3", "/ytaudio"):
+        if not url or not _is_youtube_url(url):
+            return None, "Envía un enlace de YouTube válido.\nEj: `/ytmp3 https://youtu.be/...`"
+        return url, "audio"
+
+    # /yt [calidad] <url>
+    quality = None
+    for tok in rest:
+        if URL_RE.match(tok):
+            continue
+        q = _normalize_yt_quality(tok)
+        if q:
+            quality = q
+        else:
+            return None, (
+                f"Calidad no válida: `{tok}`.\n"
+                "Opciones: `360`, `480`, `720`, `1080`, `best`, `audio`"
+            )
+    if not url or not _is_youtube_url(url):
+        return None, "Envía un enlace de YouTube válido.\nEj: `/yt 720 https://youtu.be/...`"
+    return url, quality
+
+
 async def on_tg_message(event):
     """Handler de mensajes entrantes de Telegram (Telethon).
 
     Acepta:
-    - URLs (http/https) en texto → descarga y sube a S3
+    - URLs (http/https) en texto (incluidos enlaces de YouTube) → descarga y sube a S3
     - Archivos reenviados (fotos, videos, audios, documentos) → sube a S3
     """
     try:
@@ -3562,6 +4216,7 @@ async def on_tg_message(event):
             return
 
         low = body.lower() if body else ""
+        cmd_word = low.split(None, 1)[0].split("@", 1)[0] if low else ""
 
         if low in ("/start", "hola", "ayuda", "help", "/help"):
             await event.respond(_render_help(is_userbot=_is_userbot_mode, is_admin=_is_admin(sender_id)))
@@ -3593,6 +4248,91 @@ async def on_tg_message(event):
             else:
                 _sendfile_users.add(sender_id)
                 await event.respond(_render_sendfile_state(enabled=True))
+            return
+
+        # ===== YOUTUBE: calidad y comandos dedicados =====
+        if cmd_word in ("/ytquality", "/ytq"):
+            args = body.split()[1:]
+            if not args:
+                cur = (
+                    _yt_user_quality.get(sender_id)
+                    or _normalize_yt_quality(YT_DEFAULT_QUALITY)
+                    or "720"
+                )
+                await event.respond(
+                    f"🎬 **Calidad de YouTube actual:** `{_yt_quality_label(cur)}`\n\n"
+                    "Para cambiarla usa `/ytquality <opción>`:\n"
+                    "  • `360`, `480`, `720`, `1080`\n"
+                    "  • `best` (máxima disponible)\n"
+                    "  • `audio` (solo audio MP3/M4A)"
+                )
+                return
+            q = _normalize_yt_quality(args[0])
+            if not q:
+                await event.respond(
+                    f"{ICON_ERROR} Opción no válida: `{args[0]}`\n"
+                    "Usa `360`, `480`, `720`, `1080`, `best` o `audio`."
+                )
+                return
+            _yt_user_quality[sender_id] = q
+            await event.respond(
+                f"{ICON_DONE} Calidad de YouTube fijada en **{_yt_quality_label(q)}**."
+            )
+            return
+
+        if cmd_word in ("/yt", "/ytmp3", "/ytaudio"):
+            yt_url, yt_q_or_err = _parse_yt_command(body)
+            if not yt_url:
+                await event.respond(f"{ICON_ERROR} {yt_q_or_err}")
+                return
+            if not YT_ENABLED:
+                await event.respond(
+                    _render_error("Las descargas de YouTube están desactivadas (YT_ENABLED=0).")
+                )
+                return
+            safe, err = _is_safe_url(yt_url)
+            if not safe:
+                await event.respond(_render_error(f"URL no permitida: {err}"))
+                return
+            if _is_youtube_collection_url(yt_url):
+                await event.respond(
+                    _render_error("Envía el enlace de un video individual de YouTube (no listas ni canales).")
+                )
+                return
+
+            # Si usó `/yt <url>` sin especificar calidad y estamos en modo bot,
+            # mostrar botonera interactiva para elegir calidad.
+            if yt_q_or_err is None and not _is_userbot_mode:
+                _yt_prune_pending()
+                token = uuid.uuid4().hex[:10]
+                _yt_pending_choices[token] = {
+                    "url": yt_url,
+                    "user_id": sender_id,
+                    "chat_id": chat_id,
+                    "ts": time.time(),
+                }
+                await event.respond(
+                    "🎬 **Elige la calidad de descarga:**",
+                    buttons=_build_yt_quality_buttons(token),
+                )
+                return
+
+            ahead = job_queue.position_hint(sender_id)
+            initial = (
+                f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
+                if ahead else f"{ICON_PROCESSING} Procesando..."
+            )
+            status_msg = await tg_send_status(chat_id, initial)
+            job = QueuedJob(
+                user_id=sender_id, kind="youtube", url=yt_url,
+                chat_id=chat_id, status_msg=status_msg,
+                yt_quality=yt_q_or_err,
+            )
+
+            async def _factory_yt_cmd():
+                return await process_job(job)
+
+            await job_queue.enqueue(job, _factory_yt_cmd)
             return
 
         # ===== CUENTA DE TODUS (solo admin) =====
@@ -3656,6 +4396,7 @@ async def on_tg_message(event):
             return
 
         url = match.group(1)
+        kind = "youtube" if (YT_ENABLED and _is_youtube_url(url)) else "url"
         ahead = job_queue.position_hint(sender_id)
         initial = (
             f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
@@ -3663,7 +4404,7 @@ async def on_tg_message(event):
         )
         status_msg = await tg_send_status(chat_id, initial)
         job = QueuedJob(
-            user_id=sender_id, kind="url", url=url,
+            user_id=sender_id, kind=kind, url=url,
             chat_id=chat_id, status_msg=status_msg,
         )
 
@@ -3674,6 +4415,72 @@ async def on_tg_message(event):
 
     except Exception as e:
         log.exception(f"on_tg_message: {e}")
+
+
+async def on_yt_callback(event):
+    """Maneja los botones inline de selección de calidad de /yt."""
+    try:
+        sender_id = event.sender_id
+        if ALLOWED_TG_IDS is not None and sender_id not in ALLOWED_TG_IDS:
+            await event.answer("No autorizado.", alert=True)
+            return
+
+        raw = (event.data or b"").decode("utf-8", errors="ignore")
+        parts = raw.split(":", 2)
+        if len(parts) != 3 or parts[0] != "yt":
+            return
+        _, token, choice = parts
+
+        _yt_prune_pending()
+        entry = _yt_pending_choices.get(token)
+        if not entry:
+            await event.answer("Esta selección expiró. Envía /yt <enlace> de nuevo.", alert=True)
+            try:
+                await event.edit(f"{ICON_CANCEL} Selección expirada.", buttons=None)
+            except Exception:
+                pass
+            return
+
+        if entry["user_id"] is not None and sender_id != entry["user_id"]:
+            await event.answer("Solo quien envió el enlace puede elegir.", alert=True)
+            return
+
+        _yt_pending_choices.pop(token, None)
+
+        if choice == "cancel":
+            await event.answer("Cancelado")
+            await event.edit(_render_cancel(), buttons=None)
+            return
+
+        quality = _normalize_yt_quality(choice)
+        if not quality:
+            await event.answer("Opción no válida.", alert=True)
+            return
+
+        chat_id = entry["chat_id"] or event.chat_id
+        yt_url = entry["url"]
+        await event.answer(f"Descargando en {_yt_quality_label(quality)}…")
+
+        ahead = job_queue.position_hint(sender_id)
+        initial = (
+            f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
+            if ahead else f"{ICON_PROCESSING} Procesando ({_yt_quality_label(quality)})…"
+        )
+        edited = await event.edit(initial, buttons=None)
+        status_msg = edited if hasattr(edited, "id") else getattr(event, "message_id", None)
+
+        job = QueuedJob(
+            user_id=sender_id, kind="youtube", url=yt_url,
+            chat_id=chat_id, status_msg=status_msg,
+            yt_quality=quality,
+        )
+
+        async def _factory():
+            return await process_job(job)
+
+        await job_queue.enqueue(job, _factory)
+    except Exception as e:
+        log.exception(f"on_yt_callback: {e}")
 
 
 # ============== WEB SERVER (para healthcheck de Render) ==============
@@ -3873,6 +4680,10 @@ async def main():
     _tg_client.add_event_handler(
         on_tg_message,
         events.NewMessage(incoming=True)
+    )
+    _tg_client.add_event_handler(
+        on_yt_callback,
+        events.CallbackQuery(pattern=rb"^yt:")
     )
 
     if ALLOWED_TG_IDS is not None:

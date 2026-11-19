@@ -17,5 +17,10 @@ aiofiles>=23.2.1
 # (_xmpp_session/_recv_all) que su API pública no expone.
 todus-sdk==1.10.2
 
+# YouTube: extracción/descarga de video y audio, más ffmpeg empaquetado
+# para combinar streams (1080p+/MP3) incluso en runtimes Python sin apt.
+yt-dlp>=2026.10.26
+imageio-ffmpeg>=0.5.1
+
 # Opcional: para generar SESSION_STRING si usas modo userbot
 # tgcrypto>=1.2.5  # acelera cifrado MTPROTO en sistemas con soporte AES-NI
