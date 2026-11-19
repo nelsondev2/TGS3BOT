@@ -138,7 +138,11 @@ services:
         # Calidad por defecto: 360, 480, 720, 1080, best, audio
         value: "720"
       - key: YT_COOKIES
-        # Opcional: cookies Netscape (pegar texto) si YouTube pide verificación anti-bot
+        # Opcional: cookies Netscape (texto) si YouTube pide verificación anti-bot
+        sync: false
+      - key: YT_COOKIES_B64
+        # Opcional: cookies.txt en Base64 (una sola línea, recomendado en Render;
+        # puedes obtenerlo con /ytcookies b64 desde Telegram)
         sync: false
     disk:
       # Disco para temporales y credenciales. OJO: Render solo crea
