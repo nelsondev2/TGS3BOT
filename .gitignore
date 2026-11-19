@@ -4,6 +4,8 @@ __pycache__/
 *.session-journal
 .env
 s3_namespace_state.json
+links_history.json
+yt_cookies.txt
 
 # Entorno virtual local de pruebas
 .venv/

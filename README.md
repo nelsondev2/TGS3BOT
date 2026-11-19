@@ -167,6 +167,7 @@ Si tu plataforma de deploy tiene sistema de archivos efímero (como Render free)
 | `S3_ACCESS_KEY` | `public` | Key (si S3_UNSIGNED=0) |
 | `S3_SECRET_KEY` | `public` | Secret (si S3_UNSIGNED=0) |
 | `YT_ENABLED` | `1` | `1` = detectar enlaces de YouTube y descargarlos con `yt-dlp` |
+| `YT_ASK_QUALITY` | `1` | `1` = mostrar botonera de calidades al pegar un enlace de YouTube (modo bot); `0` = descargar directo con `YT_DEFAULT_QUALITY` |
 | `YT_DEFAULT_QUALITY` | `720` | Calidad por defecto para YouTube: `360`, `480`, `720`, `1080`, `best`, `audio` |
 | `YT_COOKIES` | *(vacío)* | Contenido Netscape `cookies.txt` opcional para evitar bloqueos anti-bot de YouTube en la nube |
 | `YT_COOKIES_B64` | *(vacío)* | Igual que `YT_COOKIES` pero en Base64 (una línea, ideal para Render; obténlo con `/ytcookies b64`) |
@@ -184,6 +185,7 @@ Ver `.env.example` para referencia.
 | `/cancel`, `cancelar` | Cancela tu trabajo en curso y vacía tu cola |
 | `/status` | Muestra cuántos trabajos tienes en curso o en cola |
 | `/sendfile` | Toggle: recibir también el archivo (gasta datos) — por defecto OFF |
+| `/txt [N\|clear]` | Crea y envía un `.txt` (formato IDM/1DM+) con los últimos `N` enlaces generados (ej: `/txt 3`). Sin número incluye todo tu historial reciente |
 | `/yt <URL>` | Muestra una botonera para elegir calidad (`360p`, `480p`, `720p`, `1080p`, `Máxima`, `Audio MP3`) y lo sube a S3 (también acepta `/yt <calidad> <URL>`) |
 | `/ytmp3 <URL>` | Descarga solo el audio de YouTube (MP3/M4A) y lo sube a S3 |
 | `/ytquality [calidad]` | Consulta o cambia tu calidad por defecto para enlaces de YouTube |
@@ -193,7 +195,7 @@ Ver `.env.example` para referencia.
 | `/todusstatus` | *(solo admin)* Estado de la sesión de toDus |
 | `/toduslogout` | *(solo admin)* Cierra la sesión de toDus (vuelve a la vía anónima) |
 | `/textonly` | Alias de `/sendfile` (compatibilidad) |
-| `<URL>` | Procesa cualquier URL http/https (los enlaces de YouTube se descargan automáticamente con `yt-dlp`) |
+| `<URL>` | Procesa cualquier URL http/https (si es YouTube, muestra la botonera de calidades directamente sin necesidad de comando) |
 | `<archivo reenviado>` | Sube cualquier foto/video/audio/documento reenviado a S3. Puedes reenviar **varios seguidos**: suben en cola, uno a uno, y al final recibes un `enlaces.txt` con todos los enlaces (y el nombre original de cada archivo) para IDM/1DM+ |
 
 ### Comportamiento por defecto (ahorra datos)

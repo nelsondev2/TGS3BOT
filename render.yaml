@@ -134,6 +134,10 @@ services:
       - key: YT_ENABLED
         # "1" = detectar enlaces de YouTube y descargarlos con yt-dlp antes de subir a toDus
         value: "1"
+      - key: YT_ASK_QUALITY
+        # "1" = mostrar botonera de calidades al enviar cualquier enlace de YouTube (modo bot)
+        # "0" = descargar directo con YT_DEFAULT_QUALITY sin preguntar
+        value: "1"
       - key: YT_DEFAULT_QUALITY
         # Calidad por defecto: 360, 480, 720, 1080, best, audio
         value: "720"
