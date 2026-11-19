@@ -63,6 +63,9 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
     DocumentAttributeAudio,
+    MessageMediaWebPage,
+    MessageMediaPhoto,
+    MessageMediaDocument,
 )
 from telethon.tl.functions.messages import SendMessageRequest
 
@@ -4575,6 +4578,36 @@ def _parse_yt_command(body):
     return url, quality
 
 
+def _has_downloadable_tg_media(message, body=""):
+    """True solo si el mensaje trae un archivo real de Telegram (foto o documento).
+
+    Ignora previews de enlaces (MessageMediaWebPage, como YouTube o @vid),
+    vacíos, encuestas, etc. Si llega vía bot inline (via_bot_id) con una
+    foto de miniatura y el texto contiene un enlace de YouTube, se prioriza
+    el enlace de YouTube.
+    """
+    media = getattr(message, "media", None) if message else None
+    if media is None:
+        return False
+    if isinstance(media, MessageMediaWebPage):
+        return False
+    is_doc = (
+        getattr(media, "document", None) is not None
+        or isinstance(media, MessageMediaDocument)
+    )
+    is_photo = (
+        getattr(media, "photo", None) is not None
+        or isinstance(media, MessageMediaPhoto)
+    )
+    if not (is_doc or is_photo):
+        return False
+    if is_photo and not is_doc and getattr(message, "via_bot_id", None) and YT_ENABLED:
+        m = URL_RE.search(body or "")
+        if m and _is_youtube_url(m.group(1)):
+            return False
+    return True
+
+
 async def _handle_youtube_request(event, chat_id, sender_id, yt_url, yt_quality=None):
     """Valida un enlace de YouTube y muestra la botonera o encola la descarga."""
     if not YT_ENABLED:
@@ -4793,7 +4826,7 @@ async def on_tg_message(event):
         if _yt_ck_ts and _is_admin(sender_id):
             if time.time() - _yt_ck_ts > _YT_COOKIES_TTL:
                 _yt_pending_cookies.pop(sender_id, None)
-            elif event.message and event.message.media:
+            elif _has_downloadable_tg_media(event.message, body):
                 file_text, file_err = await _read_event_cookies_text(event)
                 if file_err:
                     await event.respond(f"{ICON_ERROR} {file_err}")
@@ -4832,7 +4865,7 @@ async def on_tg_message(event):
                 return
 
         # ===== DETECCIÓN DE MEDIA REENVIADA =====
-        if event.message and event.message.media:
+        if _has_downloadable_tg_media(event.message, body):
             # Sin rechazo: si ya hay algo en curso, este archivo espera
             # en la cola (se suben uno a uno) y su mensaje lo indica.
             ahead = job_queue.position_hint(sender_id)

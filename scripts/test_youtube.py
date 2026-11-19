@@ -472,6 +472,58 @@ class TestProcessYoutubeAsync(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(enqueued[0].url, "https://youtu.be/dQw4w9WgXcQ")
                 bot.YT_ASK_QUALITY = True
 
+                # 1c. Enlace de YouTube con preview MessageMediaWebPage (ej. via @vid)
+                from telethon.tl.types import MessageMediaWebPage, WebPageEmpty, MessageMediaPhoto, MessageMediaDocument
+                bot._yt_pending_choices.clear()
+                ev_wp = FakeEvent("https://www.youtube.com/watch?v=qnNMf3AaORY")
+                ev_wp.message.media = MessageMediaWebPage(webpage=WebPageEmpty(id=1))
+                ev_wp.message.via_bot_id = 123456
+                wp_kwargs = []
+
+                async def wp_respond(text, **kwargs):
+                    ev_wp.replies.append(text)
+                    wp_kwargs.append(kwargs)
+
+                ev_wp.respond = wp_respond
+                await bot.on_tg_message(ev_wp)
+                self.assertEqual(len(enqueued), 1)  # NO encoló tg_media
+                self.assertEqual(len(bot._yt_pending_choices), 1)
+                self.assertIn("buttons", wp_kwargs[0])
+                bot._yt_pending_choices.clear()
+
+                # 1d. Enlace normal con preview MessageMediaWebPage -> kind="url"
+                ev_wp_url = FakeEvent("https://example.com/archivo.zip")
+                ev_wp_url.message.media = MessageMediaWebPage(webpage=WebPageEmpty(id=2))
+                await bot.on_tg_message(ev_wp_url)
+                self.assertEqual(len(enqueued), 2)
+                self.assertEqual(enqueued[1].kind, "url")
+
+                # 1e. Enlace de YouTube via bot inline con MessageMediaPhoto -> YouTube
+                ev_vid_photo = FakeEvent("https://www.youtube.com/watch?v=qnNMf3AaORY")
+                ev_vid_photo.message.media = MessageMediaPhoto()
+                ev_vid_photo.message.via_bot_id = 123456
+                vp_kwargs = []
+
+                async def vp_respond(text, **kwargs):
+                    ev_vid_photo.replies.append(text)
+                    vp_kwargs.append(kwargs)
+
+                ev_vid_photo.respond = vp_respond
+                await bot.on_tg_message(ev_vid_photo)
+                self.assertEqual(len(enqueued), 2)
+                self.assertEqual(len(bot._yt_pending_choices), 1)
+                self.assertIn("buttons", vp_kwargs[0])
+                bot._yt_pending_choices.clear()
+
+                # 1f. Documento real (MessageMediaDocument) -> sigue siendo tg_media
+                ev_doc = FakeEvent("")
+                ev_doc.message.media = MessageMediaDocument()
+                await bot.on_tg_message(ev_doc)
+                self.assertEqual(len(enqueued), 3)
+                self.assertEqual(enqueued[2].kind, "tg_media")
+                enqueued.pop()  # mantener índices siguientes de la prueba
+                enqueued.pop()  # quitar también ev_wp_url para no desplazar índices
+
                 # 2. URL normal -> kind="url"
                 ev2 = FakeEvent("https://example.com/archivo.zip")
                 await bot.on_tg_message(ev2)
