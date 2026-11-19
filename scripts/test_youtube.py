@@ -439,17 +439,38 @@ class TestProcessYoutubeAsync(unittest.IsolatedAsyncioTestCase):
 
         old_allowed = bot.ALLOWED_TG_IDS
         old_userbot = bot._is_userbot_mode
+        old_ask = bot.YT_ASK_QUALITY
         bot.ALLOWED_TG_IDS = None
         bot._is_userbot_mode = False
         try:
             with patch.object(bot.job_queue, "enqueue", side_effect=fake_enqueue), \
-                 patch.object(bot, "tg_send_status", side_effect=fake_send_status):
-                # 1. URL directa de YouTube -> kind="youtube"
+                 patch.object(bot, "tg_send_status", side_effect=fake_send_status), \
+                 patch.object(bot, "_is_safe_url", return_value=(True, None)):
+                # 1a. URL directa de YouTube con YT_ASK_QUALITY=1 -> muestra botonera sin comando
+                bot.YT_ASK_QUALITY = True
+                bot._yt_pending_choices.clear()
+                direct_kwargs = []
                 ev1 = FakeEvent("mira esto https://youtu.be/dQw4w9WgXcQ")
+
+                async def ev1_respond(text, **kwargs):
+                    ev1.replies.append(text)
+                    direct_kwargs.append(kwargs)
+
+                ev1.respond = ev1_respond
                 await bot.on_tg_message(ev1)
+                self.assertEqual(len(enqueued), 0)
+                self.assertEqual(len(bot._yt_pending_choices), 1)
+                self.assertIn("buttons", direct_kwargs[0])
+                bot._yt_pending_choices.clear()
+
+                # 1b. URL directa de YouTube con YT_ASK_QUALITY=0 -> encola directo
+                bot.YT_ASK_QUALITY = False
+                ev1b = FakeEvent("mira esto https://youtu.be/dQw4w9WgXcQ")
+                await bot.on_tg_message(ev1b)
                 self.assertEqual(len(enqueued), 1)
                 self.assertEqual(enqueued[0].kind, "youtube")
                 self.assertEqual(enqueued[0].url, "https://youtu.be/dQw4w9WgXcQ")
+                bot.YT_ASK_QUALITY = True
 
                 # 2. URL normal -> kind="url"
                 ev2 = FakeEvent("https://example.com/archivo.zip")
@@ -547,6 +568,7 @@ class TestProcessYoutubeAsync(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.ALLOWED_TG_IDS = old_allowed
             bot._is_userbot_mode = old_userbot
+            bot.YT_ASK_QUALITY = old_ask
             bot._yt_user_quality.pop(999, None)
             bot._yt_pending_choices.clear()
 

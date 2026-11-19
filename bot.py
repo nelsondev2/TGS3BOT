@@ -285,6 +285,8 @@ ADMIN_TG_IDS = (
 
 # --- YouTube (yt-dlp) ---
 YT_ENABLED = os.environ.get("YT_ENABLED", "1") == "1"
+# "1" = mostrar botonera de calidades al enviar cualquier enlace de YouTube (en modo bot)
+YT_ASK_QUALITY = os.environ.get("YT_ASK_QUALITY", "1") == "1"
 # Calidad por defecto: "360", "480", "720", "1080", "best", "audio"
 YT_DEFAULT_QUALITY = os.environ.get("YT_DEFAULT_QUALITY", "720").strip().lower() or "720"
 YT_COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "").strip()
@@ -292,6 +294,7 @@ YT_COOKIES = os.environ.get("YT_COOKIES", "").strip()
 YT_COOKIES_B64 = os.environ.get("YT_COOKIES_B64", "").strip()
 YT_PLAYER_CLIENTS = os.environ.get("YT_PLAYER_CLIENTS", "").strip()
 YT_DOWNLOAD_TIMEOUT = int(os.environ.get("YT_DOWNLOAD_TIMEOUT", "1200") or "1200")
+LINKS_HISTORY_MAX = max(10, int(os.environ.get("LINKS_HISTORY_MAX", "100") or "100"))
 
 # --- HTTP Headers ---
 # OJO con Accept-Encoding: aiohttp solo decodifica gzip/deflate por
@@ -488,6 +491,9 @@ class UserJobQueue:
                     self._batch.pop(user_id, None)
                     break
                 if job.result_url:
+                    _record_user_link(
+                        user_id, job.job_id,
+                        job.result_name or "archivo", job.result_url)
                     self._batch.setdefault(user_id, []).append(
                         (job.result_name or "archivo", job.result_url))
                 if q.empty():
@@ -748,9 +754,10 @@ def _render_help(is_userbot=False, is_admin=False):
         "  /cancel — cancela tu trabajo actual",
         "  /status — muestra si tienes trabajo en curso",
         "  /sendfile — toggle: recibir archivo + URL (gasta datos)",
-        "  /yt URL — elige calidad con botones (`360p|480p|720p|1080p|máxima|audio`)",
+        "  /yt [URL] — elige calidad con botones (también funciona pegando el enlace directo)",
         "  /ytmp3 URL — descarga solo audio de YouTube",
-        "  /ytquality [calidad] — define tu calidad por defecto para enlaces directos",
+        "  /ytquality [calidad] — define tu calidad por defecto (si YT_ASK_QUALITY=0 o en userbot)",
+        "  /txt [N] — crea un .txt con los últimos N enlaces generados (ej: `/txt 3`)",
     ]
     if is_userbot:
         lines.extend([
@@ -2637,6 +2644,116 @@ async def _send_file_via_telegram(chat_id, file_path, filename, size, caption):
         return None, str(e)[:200]
 
 
+# ============== HISTORIAL DE ENLACES Y /txt ==============
+_user_links_history = None
+
+
+def _links_history_file():
+    return os.path.join(DOWNLOAD_PATH, "links_history.json")
+
+
+def _links_history_load():
+    global _user_links_history
+    if _user_links_history is not None:
+        return _user_links_history
+    data = {}
+    path = _links_history_file()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for uid, items in raw.items():
+                    if isinstance(items, list):
+                        data[str(uid)] = [
+                            it for it in items
+                            if isinstance(it, dict) and it.get("url")
+                        ][-LINKS_HISTORY_MAX:]
+    except Exception as e:
+        log.warning(f"No se pudo leer links_history.json: {e}")
+    _user_links_history = data
+    return _user_links_history
+
+
+def _links_history_save():
+    data = _links_history_load()
+    path = _links_history_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning(f"No se pudo guardar links_history.json: {e}")
+
+
+def _record_user_link(user_id, job_id, name, url):
+    if user_id is None or not url:
+        return
+    data = _links_history_load()
+    key = str(user_id)
+    entries = data.setdefault(key, [])
+    for it in entries:
+        if job_id and it.get("job_id") == job_id:
+            it["name"] = name or it.get("name") or "archivo"
+            it["url"] = url
+            _links_history_save()
+            return
+    entries.append({
+        "job_id": job_id,
+        "name": name or "archivo",
+        "url": url,
+        "ts": time.time(),
+    })
+    if len(entries) > LINKS_HISTORY_MAX:
+        del entries[:-LINKS_HISTORY_MAX]
+    _links_history_save()
+
+
+def _update_user_link(user_id, job_id, new_url):
+    if user_id is None or not job_id:
+        return
+    data = _links_history_load()
+    key = str(user_id)
+    entries = data.get(key)
+    if not entries:
+        return
+    changed = False
+    if new_url is None:
+        new_entries = [it for it in entries if it.get("job_id") != job_id]
+        if len(new_entries) != len(entries):
+            data[key] = new_entries
+            changed = True
+    else:
+        for it in entries:
+            if it.get("job_id") == job_id and it.get("url") != new_url:
+                it["url"] = new_url
+                changed = True
+                break
+    if changed:
+        _links_history_save()
+
+
+def _get_user_links(user_id, limit=None):
+    if user_id is None:
+        return []
+    data = _links_history_load()
+    entries = data.get(str(user_id), [])
+    if limit is not None and limit > 0:
+        entries = entries[-limit:]
+    return [(it.get("name") or "archivo", it["url"]) for it in entries if it.get("url")]
+
+
+def _clear_user_links(user_id):
+    if user_id is None:
+        return
+    data = _links_history_load()
+    if str(user_id) in data:
+        data.pop(str(user_id), None)
+        _links_history_save()
+
+
 # ============== LOTE: enlaces.txt para IDM (Android) ==============
 def _build_idm_txt(results):
     """Contenido del .txt de lote: UNA URL por línea y nada más.
@@ -2662,15 +2779,18 @@ def _build_idm_txt(results):
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-async def _send_links_txt(chat_id, results):
+async def _send_links_txt(chat_id, results, header=None):
     """Envía el .txt con todos los enlaces del lote."""
     payload = io.BytesIO(_build_idm_txt(results))
     payload.name = f"enlaces_{time.strftime('%Y%m%d_%H%M')}.txt"
+    lead = header or (
+        f"📋 {len(results)} enlaces del lote, cada uno con su "
+        "nombre de archivo (se descargan con el nombre original)."
+    )
     await _tg_client.send_file(
         chat_id, file=payload, force_document=True,
         caption=(
-            f"📋 {len(results)} enlaces del lote, cada uno con su "
-            "nombre de archivo (se descargan con el nombre original).\n"
+            f"{lead}\n"
             "\n"
             "En 1DM+/IDM:\n"
             "1) Descarga este .txt y déjalo en la carpeta Descargas.\n"
@@ -2950,6 +3070,7 @@ async def _process_tg_media(job):
             nonlocal status_msg
             if not alive_urls:
                 job.result_url = None
+                _update_user_link(job.user_id, job.job_id, None)
                 status_msg = await tg_edit_status(
                     chat_id, status_msg,
                     _render_error(
@@ -2958,6 +3079,7 @@ async def _process_tg_media(job):
                         "Reenvíalo, por favor."))
                 return
             job.result_url = alive_urls[0]
+            _update_user_link(job.user_id, job.job_id, alive_urls[0])
             changed = (
                 alive_urls[0] != url_final
                 or (alive_urls[1:2] or [None])[0] != url_espejo)
@@ -3140,6 +3262,7 @@ async def _process_url(job):
             nonlocal status_msg
             if not alive_urls:
                 job.result_url = None
+                _update_user_link(job.user_id, job.job_id, None)
                 status_msg = await tg_edit_status(
                     chat_id, status_msg,
                     _render_error(
@@ -3148,6 +3271,7 @@ async def _process_url(job):
                         "Reenvíalo, por favor."))
                 return
             job.result_url = alive_urls[0]
+            _update_user_link(job.user_id, job.job_id, alive_urls[0])
             changed = (
                 alive_urls[0] != url_final
                 or (alive_urls[1:2] or [None])[0] != url_espejo)
@@ -4125,6 +4249,7 @@ async def _process_youtube(job):
             nonlocal status_msg
             if not alive_urls:
                 job.result_url = None
+                _update_user_link(job.user_id, job.job_id, None)
                 status_msg = await tg_edit_status(
                     chat_id, status_msg,
                     _render_error(
@@ -4135,6 +4260,7 @@ async def _process_youtube(job):
                 )
                 return
             job.result_url = alive_urls[0]
+            _update_user_link(job.user_id, job.job_id, alive_urls[0])
             changed = (
                 alive_urls[0] != url_final
                 or (alive_urls[1:2] or [None])[0] != url_espejo
@@ -4449,6 +4575,58 @@ def _parse_yt_command(body):
     return url, quality
 
 
+async def _handle_youtube_request(event, chat_id, sender_id, yt_url, yt_quality=None):
+    """Valida un enlace de YouTube y muestra la botonera o encola la descarga."""
+    if not YT_ENABLED:
+        await event.respond(
+            _render_error("Las descargas de YouTube están desactivadas (YT_ENABLED=0).")
+        )
+        return
+    safe, err = _is_safe_url(yt_url)
+    if not safe:
+        await event.respond(_render_error(f"URL no permitida: {err}"))
+        return
+    if _is_youtube_collection_url(yt_url):
+        await event.respond(
+            _render_error("Envía el enlace de un video individual de YouTube (no listas ni canales).")
+        )
+        return
+
+    # Si no se especificó calidad (tanto `/yt <url>` como enlace pegado directo)
+    # y estamos en modo bot con YT_ASK_QUALITY=1, mostrar botonera interactiva.
+    if yt_quality is None and not _is_userbot_mode and YT_ASK_QUALITY:
+        _yt_prune_pending()
+        token = uuid.uuid4().hex[:10]
+        _yt_pending_choices[token] = {
+            "url": yt_url,
+            "user_id": sender_id,
+            "chat_id": chat_id,
+            "ts": time.time(),
+        }
+        await event.respond(
+            "🎬 **Elige la calidad de descarga:**",
+            buttons=_build_yt_quality_buttons(token),
+        )
+        return
+
+    ahead = job_queue.position_hint(sender_id)
+    initial = (
+        f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
+        if ahead else f"{ICON_PROCESSING} Procesando..."
+    )
+    status_msg = await tg_send_status(chat_id, initial)
+    job = QueuedJob(
+        user_id=sender_id, kind="youtube", url=yt_url,
+        chat_id=chat_id, status_msg=status_msg,
+        yt_quality=yt_quality,
+    )
+
+    async def _factory_yt():
+        return await process_job(job)
+
+    await job_queue.enqueue(job, _factory_yt)
+
+
 async def on_tg_message(event):
     """Handler de mensajes entrantes de Telegram (Telethon).
 
@@ -4520,6 +4698,47 @@ async def on_tg_message(event):
                 await event.respond(_render_sendfile_state(enabled=True))
             return
 
+        if cmd_word == "/txt":
+            args = body.split()[1:]
+            if args and args[0].lower() in ("clear", "limpiar", "borrar"):
+                _clear_user_links(sender_id)
+                await event.respond(f"{ICON_DONE} Historial de enlaces borrado.")
+                return
+            limit = None
+            if args:
+                if not args[0].isdigit() or int(args[0]) <= 0:
+                    await event.respond(
+                        f"{ICON_ERROR} Indica un número válido mayor que 0.\n"
+                        "Ejemplo: `/txt 3` (últimos 3 enlaces) o `/txt clear`."
+                    )
+                    return
+                limit = min(int(args[0]), LINKS_HISTORY_MAX)
+            results = _get_user_links(sender_id, limit=limit)
+            if not results:
+                await event.respond(
+                    f"{ICON_ERROR} No tienes enlaces generados todavía."
+                )
+                return
+            if limit is not None:
+                extra = (
+                    f" (pediste {limit}, hay {len(results)} disponibles)"
+                    if len(results) < limit else ""
+                )
+                lead = (
+                    f"📋 Últimos {len(results)} enlaces generados{extra}, "
+                    "cada uno con su nombre de archivo."
+                )
+            else:
+                lead = (
+                    f"📋 {len(results)} enlaces generados recientes, "
+                    "cada uno con su nombre de archivo."
+                )
+            try:
+                await _send_links_txt(chat_id, results, header=lead)
+            except Exception as e:
+                await event.respond(_render_error(f"No se pudo enviar el .txt: {str(e)[:160]}"))
+            return
+
         # ===== YOUTUBE: calidad y comandos dedicados =====
         if cmd_word in ("/ytquality", "/ytq"):
             args = body.split()[1:]
@@ -4555,54 +4774,7 @@ async def on_tg_message(event):
             if not yt_url:
                 await event.respond(f"{ICON_ERROR} {yt_q_or_err}")
                 return
-            if not YT_ENABLED:
-                await event.respond(
-                    _render_error("Las descargas de YouTube están desactivadas (YT_ENABLED=0).")
-                )
-                return
-            safe, err = _is_safe_url(yt_url)
-            if not safe:
-                await event.respond(_render_error(f"URL no permitida: {err}"))
-                return
-            if _is_youtube_collection_url(yt_url):
-                await event.respond(
-                    _render_error("Envía el enlace de un video individual de YouTube (no listas ni canales).")
-                )
-                return
-
-            # Si usó `/yt <url>` sin especificar calidad y estamos en modo bot,
-            # mostrar botonera interactiva para elegir calidad.
-            if yt_q_or_err is None and not _is_userbot_mode:
-                _yt_prune_pending()
-                token = uuid.uuid4().hex[:10]
-                _yt_pending_choices[token] = {
-                    "url": yt_url,
-                    "user_id": sender_id,
-                    "chat_id": chat_id,
-                    "ts": time.time(),
-                }
-                await event.respond(
-                    "🎬 **Elige la calidad de descarga:**",
-                    buttons=_build_yt_quality_buttons(token),
-                )
-                return
-
-            ahead = job_queue.position_hint(sender_id)
-            initial = (
-                f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
-                if ahead else f"{ICON_PROCESSING} Procesando..."
-            )
-            status_msg = await tg_send_status(chat_id, initial)
-            job = QueuedJob(
-                user_id=sender_id, kind="youtube", url=yt_url,
-                chat_id=chat_id, status_msg=status_msg,
-                yt_quality=yt_q_or_err,
-            )
-
-            async def _factory_yt_cmd():
-                return await process_job(job)
-
-            await job_queue.enqueue(job, _factory_yt_cmd)
+            await _handle_youtube_request(event, chat_id, sender_id, yt_url, yt_q_or_err)
             return
 
         # ===== YOUTUBE: cookies (solo admin) =====
@@ -4693,7 +4865,10 @@ async def on_tg_message(event):
             return
 
         url = match.group(1)
-        kind = "youtube" if (YT_ENABLED and _is_youtube_url(url)) else "url"
+        if YT_ENABLED and _is_youtube_url(url):
+            await _handle_youtube_request(event, chat_id, sender_id, url, None)
+            return
+
         ahead = job_queue.position_hint(sender_id)
         initial = (
             f"{ICON_PROCESSING} En cola (posición {ahead + 1})…"
@@ -4701,7 +4876,7 @@ async def on_tg_message(event):
         )
         status_msg = await tg_send_status(chat_id, initial)
         job = QueuedJob(
-            user_id=sender_id, kind=kind, url=url,
+            user_id=sender_id, kind="url", url=url,
             chat_id=chat_id, status_msg=status_msg,
         )
 
